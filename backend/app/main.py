@@ -1,26 +1,42 @@
 """
 FastAPI entrypoint.
 
-There is no real database yet: app.database.db is an in-memory store seeded
-with a few fictitious demo accounts (seed_fake_data()) so the whole API is
-exercisable end-to-end without any external service. Run with:
+Users and shops are persisted in a real MySQL database — see
+backend/db/projectwork_en_v2.sql for the schema+seed data and
+app/db/engine.py for the connection. Run with:
 
     uvicorn app.main:app --reload   (run from inside backend/)
 
 then open http://127.0.0.1:8000/docs for interactive Swagger docs.
 """
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 
-from .database import seed_fake_data
+from .db.engine import engine
 from .routers import admin, auth, shops, users
+
+logger = logging.getLogger("toogood.startup")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    seed_fake_data()
+    # Fail fast with a clear message rather than a cryptic error on the
+    # first request if the DB isn't reachable/provisioned.
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+    except OperationalError as exc:
+        logger.error(
+            "Could not connect to the database (%s). Is MySQL/MariaDB running, and has "
+            "backend/db/projectwork_en_v2.sql been imported? See backend/README.md.",
+            exc,
+        )
+        raise
     yield
 
 

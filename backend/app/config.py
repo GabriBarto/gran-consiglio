@@ -1,8 +1,9 @@
 """
 Central app configuration, read from environment variables / a local .env
-file (see .env.example). Nothing here talks to a real external database or
-mail/storage provider by default — see database.py, email_utils.py and
-storage.py for the fake/mock implementations used until those are available.
+file (see .env.example). Users and shops are now persisted in a real MySQL
+(MariaDB-compatible) database — see backend/db/projectwork_en_v2.sql for the
+schema and app/db/ for the SQLAlchemy layer. Mail/storage remain
+fake/mock implementations for now — see email_utils.py and storage.py.
 """
 from __future__ import annotations
 
@@ -15,6 +16,12 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_name: str = "Gran Consiglio / TooGood API"
+
+    # MySQL/MariaDB connection. Default matches a stock local XAMPP install
+    # (root, no password, default port). Point this at a different server
+    # via the DATABASE_URL env var / .env — nothing else needs to change,
+    # see app/db/engine.py.
+    database_url: str = "mysql+pymysql://root:@127.0.0.1:3306/toogood"
 
     # WARNING: this default is for local development only. Always set a
     # real SECRET_KEY via environment variable (or .env, never committed)

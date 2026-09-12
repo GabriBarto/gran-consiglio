@@ -1,10 +1,13 @@
 """
-Smoke tests covering the main flows end-to-end against the in-memory fake
-DB: customer registration -> email verification -> login -> refresh, and
-vendor registration with a license upload -> upgrade-to-vendor for an
-existing customer.
+Smoke tests covering the main flows end-to-end against the real (test)
+MySQL database: customer registration -> email verification -> login ->
+refresh, and vendor registration with a license upload (which now also
+auto-creates a placeholder shop, since the schema ties licenseUrl to
+`store`, not to `user`) -> upgrade-to-vendor for an existing customer.
 
-Run from the backend/ directory with: pytest
+Run from the backend/ directory with: pytest (conftest.py points this at a
+dedicated toogood_test database, reloaded fresh from
+backend/db/projectwork_en_v2.sql before the session starts).
 """
 from __future__ import annotations
 
@@ -16,10 +19,8 @@ from app.database import db
 from app.main import app
 
 # NOTE: TestClient must be used as a context manager (or __enter__()'d) for
-# Starlette to fire the app's lifespan/startup hook — otherwise
-# seed_fake_data() never runs and the seeded demo accounts silently don't
-# exist. Doesn't affect the tests below (they don't touch seeded users) but
-# any future test relying on them needs this.
+# Starlette to fire the app's lifespan hook (the DB-connectivity check in
+# app/main.py) — otherwise a broken DB connection would go unnoticed here.
 client = TestClient(app).__enter__()
 
 
@@ -47,7 +48,7 @@ def test_register_login_and_refresh_flow():
     assert dup.status_code == 409
 
     # Verify email via the OTP that was "sent" (captured straight from the
-    # in-memory store, since there's no real mailbox in tests).
+    # in-memory bookkeeping, since there's no real mailbox in tests).
     user = db.get_by_email("new.customer@example.com")
     otp = db.pending_verifications[user.id]["otp"]
     verify = client.post("/auth/verify-email", json={"email": user.email, "otp": otp})
@@ -70,7 +71,7 @@ def test_register_login_and_refresh_flow():
     assert reused.status_code == 401
 
 
-def test_register_vendor_with_license_upload():
+def test_register_vendor_with_license_upload_creates_placeholder_shop():
     resp = client.post(
         "/auth/register/vendor",
         data={
@@ -86,7 +87,20 @@ def test_register_vendor_with_license_upload():
     assert resp.status_code == 201, resp.text
     body = resp.json()
     assert body["role"] == "vendor"
-    assert body["license"]["status"] == "pending_review"
+    # License now lives on the shop (real schema ties it to `store`), not
+    # on the user response — a fresh vendor should already have one,
+    # auto-created from the registration data.
+    assert "license" not in body
+
+    login = client.post("/auth/login", json={"email": "nuovo.venditore@example.com", "password": "Password123"})
+    token = login.json()["access_token"]
+    shop = client.get("/shops/me", headers={"Authorization": f"Bearer {token}"})
+    assert shop.status_code == 200, shop.text
+    shop_body = shop.json()
+    assert shop_body["license_status"] == "pending_review"
+    assert shop_body["license_url"]
+    assert shop_body["address"] == "Via Test 1, Roma"
+    assert shop_body["phone"] == "+39 333 0000000"
 
 
 def test_forgot_and_reset_password():
@@ -96,15 +110,6 @@ def test_forgot_and_reset_password():
     forgot = client.post("/auth/forgot-password", json={"email": user.email})
     assert forgot.status_code == 200
 
-    token = None
-    for u_id, pending in db.pending_resets.items():
-        if u_id == user.id:
-            token = pending["jti"]
-    assert token is not None  # a reset was actually recorded
-
-    # Recover the real JWT rather than just its jti, by re-issuing one and
-    # overwriting the bookkeeping (keeps the test independent from log
-    # capture / email transport).
     from app import security
 
     jwt_token = security.create_password_reset_token(user.id)
@@ -123,7 +128,7 @@ def test_forgot_and_reset_password():
     assert login_new.status_code == 200
 
 
-def test_upgrade_customer_to_vendor():
+def test_upgrade_customer_to_vendor_creates_placeholder_shop():
     _register_customer(email="upgrade.me@example.com", username="Upgrade Me")
     login = client.post("/auth/login", json={"email": "upgrade.me@example.com", "password": "Password123"})
     token = login.json()["access_token"]
@@ -137,12 +142,17 @@ def test_upgrade_customer_to_vendor():
     assert upgrade.status_code == 200, upgrade.text
     assert upgrade.json()["role"] == "vendor"
 
+    shop = client.get("/shops/me", headers={"Authorization": f"Bearer {token}"})
+    assert shop.status_code == 200
+    assert shop.json()["address"] == "Via Upgrade 9, Milano"
+
 
 def test_seeded_demo_accounts_are_present_and_can_log_in():
-    # Guards against the lifespan/seed_fake_data() gotcha noted above: if
-    # TestClient ever stops being entered as a context manager, this is the
-    # test that would catch it.
+    # Guards against the lifespan/seed-data gotcha noted above: if the test
+    # DB ever stopped being reloaded from backend/db/projectwork_en_v2.sql,
+    # this is the test that would catch it.
     for email in (
+        "admin@example.com",
         "cliente.demo@example.com",
         "vivaio.rossi@example.com",
         "ortofrutta.bianchi@example.com",

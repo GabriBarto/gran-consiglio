@@ -25,10 +25,9 @@ def list_shops_for_review(
     ),
     admin: User = Depends(require_admin),
 ) -> List[ShopPublic]:
-    shops = db.list_shops()
+    shops = db.list_shops()  # already ordered by id (creation order)
     if review_status:
         shops = [s for s in shops if s.license_status == review_status]
-    shops.sort(key=lambda s: s.created_at)
     return [to_public_shop(s) for s in shops]
 
 
@@ -44,14 +43,4 @@ def set_shop_license_status(
 
     shop.license_status = payload.status
     db.save_shop(shop)
-
-    # Keep the owning vendor's account-level license.status (set at
-    # registration / upgrade-to-vendor time, see routers/auth.py and
-    # routers/users.py) in sync: it's the same real-world review,
-    # surfaced in two places for now until shops fully replace that field.
-    vendor = db.get_by_id(shop.vendor_id)
-    if vendor and vendor.license:
-        vendor.license.status = payload.status
-        db.save(vendor)
-
     return to_public_shop(shop)

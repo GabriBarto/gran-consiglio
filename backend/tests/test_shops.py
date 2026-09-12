@@ -1,12 +1,21 @@
 """
 Tests for shop CRUD, admin license-status moderation, and Haversine-based
-search (city filter + lat/lng/radius, ordering, pagination, visibility of
-unapproved shops).
+search (address-substring filter + lat/lng/radius, ordering, pagination,
+visibility of unapproved shops) against the real (test) MySQL database.
 
-Run from the backend/ directory with: pytest
+Becoming a vendor (register/vendor or upgrade-to-vendor) auto-creates a
+placeholder shop (lat=0, lng=0) — see routers/auth.py and routers/users.py
+— so most tests here start from that shop rather than calling POST /shops
+themselves; POST /shops is exercised directly in its own tests (recreating
+after a delete, and the "already has a shop" 409).
+
+Run from the backend/ directory with: pytest (conftest.py points this at a
+dedicated toogood_test database, reloaded fresh from
+backend/db/projectwork_en_v2.sql before the session starts).
 """
 from __future__ import annotations
 
+import io
 import math
 
 from fastapi.testclient import TestClient
@@ -16,19 +25,17 @@ from app.main import app
 
 client = TestClient(app).__enter__()
 
-VALID_HOURS = [{"day": "mon", "start": "09:00", "end": "18:00"}]
+VALID_LICENSE_FILE = {"license_file": ("lic.pdf", io.BytesIO(b"%PDF-1.4 x"), "application/pdf")}
 
 
 def _auth_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}"}
 
 
-def _new_vendor_token(email: str, username: str) -> tuple[str, str]:
-    """Registers+verifies+logs in a fresh vendor via the upgrade-to-vendor
-    path (customer registration is JSON-only, no file upload needed) and
-    returns (user_id, access_token)."""
-    import io
-
+def _new_vendor(email: str, username: str, *, shop_address: str = "Via Test 1", phone: str = "+39 333 1230000"):
+    """Registers+logs in a fresh vendor via upgrade-to-vendor (customer
+    registration is JSON-only). Returns (user_id, access_token) — the
+    vendor already has a placeholder shop at lat=0/lng=0 afterwards."""
     r = client.post(
         "/auth/register/customer",
         json={"email": email, "username": username, "password": "Password123", "password_confirm": "Password123"},
@@ -42,8 +49,8 @@ def _new_vendor_token(email: str, username: str) -> tuple[str, str]:
     up = client.post(
         "/users/me/upgrade-to-vendor",
         headers=_auth_headers(token),
-        data={"phone": "+39 333 1230000", "shop_address": "Via Test 1"},
-        files={"license_file": ("lic.pdf", io.BytesIO(b"%PDF-1.4 x"), "application/pdf")},
+        data={"phone": phone, "shop_address": shop_address},
+        files=VALID_LICENSE_FILE,
     )
     assert up.status_code == 200, up.text
     return user_id, token
@@ -60,38 +67,30 @@ def _admin_token() -> str:
 # ---------------------------------------------------------------------------
 
 def test_shop_crud_happy_path():
-    _, token = _new_vendor_token("shop.owner1@example.com", "Shop Owner One")
+    _, token = _new_vendor("shop.owner1@example.com", "Shop Owner One", shop_address="Via Roma 1, Siena")
 
-    payload = {
-        "name": "Bottega Test",
-        "address": "Via Roma 1",
-        "city": "Siena",
+    # Already has a placeholder shop from upgrade-to-vendor.
+    me = client.get("/shops/me", headers=_auth_headers(token))
+    assert me.status_code == 200
+    body = me.json()
+    assert body["license_status"] == "pending_review"
+    assert body["address"] == "Via Roma 1, Siena"
+    assert body["lat"] == 0.0 and body["lng"] == 0.0
+
+    update_payload = {
+        "name": "Bottega Test Rinominata",
+        "address": "Via Roma 1, Siena",
         "lat": 43.3188,
         "lng": 11.3307,
         "phone": "+39 333 1112222",
-        "opening_hours": VALID_HOURS,
-        "pickup_window": [{"day": "mon", "start": "17:00", "end": "18:00"}],
+        "opening_time": "08:00",
+        "pickup_window_start": "17:00",
+        "pickup_window_end": "18:00",
     }
-    r = client.post("/shops", json=payload, headers=_auth_headers(token))
-    assert r.status_code == 201, r.text
-    body = r.json()
-    assert body["license_status"] == "pending_review"
-    assert body["name"] == "Bottega Test"
-    shop_id = body["id"]
-
-    # a vendor can only have one shop
-    dup = client.post("/shops", json=payload, headers=_auth_headers(token))
-    assert dup.status_code == 409, dup.text
-
-    me = client.get("/shops/me", headers=_auth_headers(token))
-    assert me.status_code == 200
-    assert me.json()["id"] == shop_id
-
-    updated = dict(payload, name="Bottega Test Rinominata", city="Firenze")
-    put = client.put("/shops/me", json=updated, headers=_auth_headers(token))
+    put = client.put("/shops/me", json=update_payload, headers=_auth_headers(token))
     assert put.status_code == 200, put.text
     assert put.json()["name"] == "Bottega Test Rinominata"
-    assert put.json()["city"] == "Firenze"
+    assert put.json()["lat"] == 43.3188
     # PUT cannot touch license_status (it's not even in the payload schema)
     assert put.json()["license_status"] == "pending_review"
 
@@ -100,6 +99,33 @@ def test_shop_crud_happy_path():
 
     gone = client.get("/shops/me", headers=_auth_headers(token))
     assert gone.status_code == 404
+
+    # Recreate from scratch via the multipart create endpoint.
+    create = client.post(
+        "/shops",
+        data={
+            "name": "Bottega Ricreata", "address": "Via Roma 1, Siena",
+            "lat": "43.3188", "lng": "11.3307", "phone": "+39 333 1112222",
+            "opening_time": "08:00", "pickup_window_start": "17:00", "pickup_window_end": "18:00",
+        },
+        files=VALID_LICENSE_FILE,
+        headers=_auth_headers(token),
+    )
+    assert create.status_code == 201, create.text
+    assert create.json()["name"] == "Bottega Ricreata"
+
+    # A vendor can only have one shop.
+    dup = client.post(
+        "/shops",
+        data={
+            "name": "Altro Negozio", "address": "Via Roma 1, Siena",
+            "lat": "43.3188", "lng": "11.3307", "phone": "+39 333 1112222",
+            "opening_time": "08:00", "pickup_window_start": "17:00", "pickup_window_end": "18:00",
+        },
+        files=VALID_LICENSE_FILE,
+        headers=_auth_headers(token),
+    )
+    assert dup.status_code == 409, dup.text
 
 
 def test_shop_requires_vendor_role():
@@ -115,47 +141,70 @@ def test_shop_requires_vendor_role():
     login = client.post("/auth/login", json={"email": "plain.customer@example.com", "password": "Password123"})
     token = login.json()["access_token"]
 
-    payload = {
-        "name": "Negozio Abusivo", "address": "Via X", "city": "Roma",
-        "lat": 41.9, "lng": 12.5, "phone": "+39 333 0000000",
-        "opening_hours": [], "pickup_window": [],
-    }
-    r = client.post("/shops", json=payload, headers=_auth_headers(token))
+    r = client.post(
+        "/shops",
+        data={
+            "name": "Negozio Abusivo", "address": "Via X",
+            "lat": "41.9", "lng": "12.5", "phone": "+39 333 0000000",
+            "opening_time": "09:00", "pickup_window_start": "18:00", "pickup_window_end": "19:00",
+        },
+        files=VALID_LICENSE_FILE,
+        headers=_auth_headers(token),
+    )
     assert r.status_code == 403, r.text
 
 
 def test_shop_validation_errors():
-    _, token = _new_vendor_token("shop.owner2@example.com", "Shop Owner Two")
+    # Validation runs before the "already has a shop" 409 check, so this
+    # works fine even though this vendor already has a placeholder shop.
+    _, token = _new_vendor("shop.owner2@example.com", "Shop Owner Two")
 
     base = {
-        "name": "Negozio Valido", "address": "Via X", "city": "Roma",
-        "lat": 41.9, "lng": 12.5, "phone": "+39 333 0000001",
-        "opening_hours": [], "pickup_window": [],
+        "name": "Negozio Valido", "address": "Via X", "phone": "+39 333 0000001",
+        "opening_time": "09:00", "pickup_window_start": "18:00", "pickup_window_end": "19:00",
     }
 
-    bad_lat = dict(base, lat=999)
-    assert client.post("/shops", json=bad_lat, headers=_auth_headers(token)).status_code == 422
+    def post(overrides):
+        data = {**base, "lat": "41.9", "lng": "12.5", **overrides}
+        return client.post("/shops", data=data, files=VALID_LICENSE_FILE, headers=_auth_headers(token))
 
-    bad_phone = dict(base, phone="abc")
-    assert client.post("/shops", json=bad_phone, headers=_auth_headers(token)).status_code == 422
+    assert post({"lat": "999"}).status_code == 422
+    assert post({"phone": "abc"}).status_code == 422
+    assert post({"opening_time": "9am"}).status_code == 422
+    assert post({"pickup_window_start": "18:00", "pickup_window_end": "09:00"}).status_code == 422
+    assert post({"name": "A"}).status_code == 422  # too short
 
-    bad_time = dict(base, opening_hours=[{"day": "mon", "start": "9am", "end": "18:00"}])
-    assert client.post("/shops", json=bad_time, headers=_auth_headers(token)).status_code == 422
 
-    inverted = dict(base, opening_hours=[{"day": "mon", "start": "18:00", "end": "09:00"}])
-    assert client.post("/shops", json=inverted, headers=_auth_headers(token)).status_code == 422
+def test_replace_shop_license():
+    _, token = _new_vendor("shop.owner3b@example.com", "Shop Owner Three B")
+    admin_token = _admin_token()
 
-    dup_day = dict(base, opening_hours=[
-        {"day": "mon", "start": "09:00", "end": "12:00"},
-        {"day": "mon", "start": "14:00", "end": "18:00"},
-    ])
-    assert client.post("/shops", json=dup_day, headers=_auth_headers(token)).status_code == 422
+    me = client.get("/shops/me", headers=_auth_headers(token)).json()
+    approve = client.patch(
+        f"/admin/shops/{me['id']}/license-status", json={"status": "approved"}, headers=_auth_headers(admin_token)
+    )
+    assert approve.status_code == 200
+    assert approve.json()["license_status"] == "approved"
 
-    missing_times = dict(base, opening_hours=[{"day": "mon", "closed": False}])
-    assert client.post("/shops", json=missing_times, headers=_auth_headers(token)).status_code == 422
+    replaced = client.put(
+        "/shops/me/license",
+        files={"license_file": ("nuova.pdf", io.BytesIO(b"%PDF-1.4 nuova"), "application/pdf")},
+        headers=_auth_headers(token),
+    )
+    assert replaced.status_code == 200, replaced.text
+    # Re-uploading resets the review status back to pending.
+    assert replaced.json()["license_status"] == "pending_review"
+    assert replaced.json()["license_url"] != me["license_url"]
 
-    ok_closed = dict(base, opening_hours=[{"day": "sun", "closed": True}])
-    assert client.post("/shops", json=ok_closed, headers=_auth_headers(token)).status_code == 201
+    # vendor-only
+    cust_login = client.post("/auth/login", json={"email": "cliente.demo@example.com", "password": "Password123"})
+    cust_token = cust_login.json()["access_token"]
+    forbidden = client.put(
+        "/shops/me/license",
+        files={"license_file": ("x.pdf", io.BytesIO(b"%PDF-1.4 x"), "application/pdf")},
+        headers=_auth_headers(cust_token),
+    )
+    assert forbidden.status_code == 403
 
 
 # ---------------------------------------------------------------------------
@@ -163,13 +212,8 @@ def test_shop_validation_errors():
 # ---------------------------------------------------------------------------
 
 def test_admin_only_can_change_license_status():
-    _, vendor_token = _new_vendor_token("shop.owner3@example.com", "Shop Owner Three")
-    payload = {
-        "name": "Da Moderare", "address": "Via Y", "city": "Napoli",
-        "lat": 40.85, "lng": 14.27, "phone": "+39 333 0000002",
-        "opening_hours": [], "pickup_window": [],
-    }
-    shop = client.post("/shops", json=payload, headers=_auth_headers(vendor_token)).json()
+    _, vendor_token = _new_vendor("shop.owner3@example.com", "Shop Owner Three", shop_address="Via Y, Napoli")
+    shop = client.get("/shops/me", headers=_auth_headers(vendor_token)).json()
 
     # vendor itself cannot call the admin endpoint
     forbidden = client.patch(
@@ -187,10 +231,6 @@ def test_admin_only_can_change_license_status():
     )
     assert approve.status_code == 200, approve.text
     assert approve.json()["license_status"] == "approved"
-
-    # side effect: the vendor's account-level license status is kept in sync
-    vendor_user = db.get_by_id(shop["vendor_id"])
-    assert vendor_user.license.status.value == "approved"
 
     # now visible via plain GET /shops/{id} to an anonymous caller
     public = client.get(f"/shops/{shop['id']}")
@@ -223,55 +263,49 @@ def test_admin_list_shops_filtered_by_status():
 
 
 # ---------------------------------------------------------------------------
-# Public search (city + haversine distance + radius + pagination)
+# Public search (address substring + haversine distance + radius + pagination)
 # ---------------------------------------------------------------------------
 
-def test_search_hides_unapproved_and_filters_by_city():
-    # From seed data: "Vivaio Rossi" (Firenze, approved) is visible;
-    # "Ortofrutta Bianchi" (Bologna, pending_review) is not.
+def test_search_hides_unapproved_and_filters_by_address():
+    # From seed data: "Vivaio Rossi - Centro" (Firenze, approved) is
+    # visible; "Ortofrutta Bianchi" (Bologna, pending_review) is not.
     r = client.get("/shops")
     assert r.status_code == 200
     names = {s["name"] for s in r.json()["items"]}
-    assert "Vivaio Rossi" in names
+    assert "Vivaio Rossi - Centro" in names
     assert "Ortofrutta Bianchi" not in names
 
     r_city = client.get("/shops", params={"city": "firenze"})
-    assert all(s["city"].lower() == "firenze" for s in r_city.json()["items"])
-    assert any(s["name"] == "Vivaio Rossi" for s in r_city.json()["items"])
+    assert all("firenze" in s["address"].lower() for s in r_city.json()["items"])
+    assert any(s["name"] == "Vivaio Rossi - Centro" for s in r_city.json()["items"])
 
     r_other_city = client.get("/shops", params={"city": "Bolzano"})
     assert r_other_city.json()["items"] == []
 
 
 def test_search_distance_and_radius_and_pagination():
-    _, token_a = _new_vendor_token("geo.a@example.com", "Geo Vendor A")
-    _, token_b = _new_vendor_token("geo.b@example.com", "Geo Vendor B")
+    _, token_a = _new_vendor("geo.a@example.com", "Geo Near", shop_address="Via Equatore 1, Geoville")
+    _, token_b = _new_vendor("geo.b@example.com", "Geo Far", shop_address="Via Equatore 2, Geoville")
     admin_token = _admin_token()
 
-    # Two points exactly 1 degree of longitude apart on the equator are
-    # ~111.19 km apart (great-circle) — a stable, hand-checkable fixture.
-    shop_near = client.post(
-        "/shops",
+    # "Geo Near" is already at the placeholder (0, 0) — exactly the search
+    # origin below. Move "Geo Far" 5 degrees of longitude away: at the
+    # equator that's a stable, hand-checkable ~555.95 km.
+    move_far = client.put(
+        "/shops/me",
         json={
-            "name": "Geo Near", "address": "Via Equatore 1", "city": "Geoville",
-            "lat": 0.0, "lng": 0.0, "phone": "+39 333 5551111",
-            "opening_hours": [], "pickup_window": [],
-        },
-        headers=_auth_headers(token_a),
-    ).json()
-    shop_far = client.post(
-        "/shops",
-        json={
-            "name": "Geo Far", "address": "Via Equatore 2", "city": "Geoville",
+            "name": "Geo Far", "address": "Via Equatore 2, Geoville",
             "lat": 0.0, "lng": 5.0, "phone": "+39 333 5552222",
-            "opening_hours": [], "pickup_window": [],
+            "opening_time": "09:00", "pickup_window_start": "18:00", "pickup_window_end": "19:00",
         },
         headers=_auth_headers(token_b),
-    ).json()
+    )
+    assert move_far.status_code == 200, move_far.text
 
-    for sid in (shop_near["id"], shop_far["id"]):
+    for token in (token_a, token_b):
+        shop_id = client.get("/shops/me", headers=_auth_headers(token)).json()["id"]
         approve = client.patch(
-            f"/admin/shops/{sid}/license-status", json={"status": "approved"}, headers=_auth_headers(admin_token)
+            f"/admin/shops/{shop_id}/license-status", json={"status": "approved"}, headers=_auth_headers(admin_token)
         )
         assert approve.status_code == 200
 

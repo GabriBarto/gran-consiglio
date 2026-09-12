@@ -14,7 +14,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 
 from .. import email_utils, security, storage
 from ..config import settings
-from ..database import License, User, db, to_public_user
+from ..database import User, db, to_public_user
 from ..schemas import (
     ForgotPasswordRequest,
     LoginRequest,
@@ -119,8 +119,6 @@ async def register_vendor(
             email=email,
             username=username,
             password_hash=security.hash_password(password),
-            phone=phone.strip(),
-            shop_address=shop_address.strip(),
         )
     except ValueError as exc:
         raise _uniqueness_error(exc)
@@ -134,16 +132,32 @@ async def register_vendor(
             data=data,
         )
     except storage.UploadRejected as exc:
-        # The account itself is created; only the license upload failed.
-        # Surface that clearly so the client can retry it separately
-        # (PUT /users/me/license) instead of losing the whole registration.
+        # The account itself is created; only the license upload (and thus
+        # the store) failed. Surface that clearly — the client can retry
+        # via POST /shops once they have a working file.
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             f"Account creato, ma il caricamento della licenza è fallito: {exc}",
         )
 
-    user.license = License(file_name=stored.file_name, content_type=stored.content_type, storage_url=stored.url)
-    db.save(user)
+    # The real schema ties the license to a `store` row, not to the user
+    # account (see backend/db/projectwork_en_v2.sql), so registering as a
+    # vendor creates a minimal placeholder store right away — using the
+    # phone/address collected here — so the license has somewhere to live.
+    # lat/lng and hours are unknown at this point; the vendor fills them in
+    # afterwards via PUT /shops/me.
+    db.create_shop(
+        vendor_id=user.id,
+        name=username.strip(),
+        address=shop_address.strip(),
+        lat=0.0,
+        lng=0.0,
+        phone=phone.strip(),
+        license_url=stored.url,
+        opening_time="09:00",
+        pickup_window_start="18:00",
+        pickup_window_end="19:00",
+    )
 
     _start_email_verification(user)
     return to_public_user(user)

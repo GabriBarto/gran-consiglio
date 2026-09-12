@@ -4,7 +4,10 @@ Pydantic request/response models for the API.
 Field names/roles mirror the shapes already used by the mock frontend layer
 in src/api/auth.js (role: customer/vendor, license.status:
 pending_review/approved/rejected) so wiring a real HTTP client into the app
-later is a small change.
+later is a small change. The app-level vocabulary here (customer/vendor,
+pending_review/approved/rejected) is intentionally kept stable even though
+the real DB enums differ (client/seller, pending/approved/rejected) — see
+app/database.py for the mapping at the persistence boundary.
 """
 from __future__ import annotations
 
@@ -22,7 +25,7 @@ class UserRole(str, Enum):
     CUSTOMER = "customer"
     VENDOR = "vendor"
     # Admins are never self-registered (no public endpoint creates one) —
-    # only seeded as fake data for now (see database.seed_fake_data()).
+    # only seeded as fake data for now (see backend/db/projectwork_en_v2.sql).
     # A real deployment would provision them out-of-band (DB migration,
     # internal CLI, ...), not through a public API.
     ADMIN = "admin"
@@ -38,13 +41,6 @@ class LicenseStatus(str, Enum):
 # Public representations
 # ---------------------------------------------------------------------------
 
-class LicenseInfo(BaseModel):
-    file_name: str
-    content_type: Optional[str] = None
-    status: LicenseStatus
-    uploaded_at: datetime
-
-
 class UserPublic(BaseModel):
     id: str
     role: UserRole
@@ -52,9 +48,9 @@ class UserPublic(BaseModel):
     username: str
     email_verified: bool
     created_at: datetime
-    phone: Optional[str] = None
-    shop_address: Optional[str] = None
-    license: Optional[LicenseInfo] = None
+    # Note: phone/address/license used to live here (point 1) but the real
+    # schema puts them on `store` instead (point 2) — a vendor's own shop
+    # details now come from GET /shops/me, not from this response.
 
 
 class TokenPair(BaseModel):
@@ -153,95 +149,54 @@ class ResetPasswordRequest(BaseModel):
 
 # ---------------------------------------------------------------------------
 # Shops (vendor storefronts)
+#
+# Field set matches `store` in backend/db/projectwork_en_v2.sql exactly:
+# a single daily openingTime, a single daily pickupWindowStart/End (not a
+# per-weekday schedule — the real schema doesn't model that), a free-text
+# `address` (no separate city column — see the `city` search param on
+# GET /shops in routers/shops.py, which matches as a substring of address).
 # ---------------------------------------------------------------------------
 
 TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")  # 24h "HH:MM"
 
 
-class Weekday(str, Enum):
-    MON = "mon"
-    TUE = "tue"
-    WED = "wed"
-    THU = "thu"
-    FRI = "fri"
-    SAT = "sat"
-    SUN = "sun"
-
-
-class DaySchedule(BaseModel):
-    """One weekday's entry in a shop's opening_hours or pickup_window list.
-    HH:MM strings compare correctly as plain strings (fixed-width,
-    zero-padded, 24h), so no need to parse them into datetime.time just to
-    check start < end."""
-
-    day: Weekday
-    closed: bool = False
-    start: Optional[str] = Field(None, description="Formato HH:MM (24h)")
-    end: Optional[str] = Field(None, description="Formato HH:MM (24h)")
-
-    @field_validator("start", "end")
-    @classmethod
-    def _check_time_format(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None and not TIME_RE.match(v):
-            raise ValueError("Orario non valido: usa il formato HH:MM (24h).")
-        return v
-
-    @model_validator(mode="after")
-    def _check_consistency(self) -> "DaySchedule":
-        if not self.closed:
-            if not self.start or not self.end:
-                raise ValueError("Specifica start ed end, oppure closed=true.")
-            if self.start >= self.end:
-                raise ValueError("L'orario di inizio deve precedere quello di fine.")
-        return self
-
-
-def _check_no_duplicate_days(schedule: List[DaySchedule]) -> List[DaySchedule]:
-    days = [slot.day for slot in schedule]
-    if len(days) != len(set(days)):
-        raise ValueError("Non puoi avere più voci per lo stesso giorno della settimana.")
-    return schedule
+def _validate_hhmm(v: str) -> str:
+    if not TIME_RE.match(v):
+        raise ValueError("Orario non valido: usa il formato HH:MM (24h).")
+    return v
 
 
 class ShopRequest(BaseModel):
     """Shared shape for creating and (fully) updating a shop. Notice
-    license_status has no field here at all — a vendor structurally cannot
-    submit it; only the admin-only ShopLicenseStatusUpdate below can change
-    it (see POST /admin/shops/{id}/license-status)."""
+    license_status/license_url have no field here at all — a vendor
+    structurally cannot submit them; only the admin-only
+    ShopLicenseStatusUpdate below can change verification status (see
+    PATCH /admin/shops/{id}/license-status), and license_url is set from
+    the uploaded file, not typed in by the client."""
 
     name: str
     address: str
-    city: str
     lat: float = Field(..., ge=-90, le=90)
     lng: float = Field(..., ge=-180, le=180)
     phone: str
-    opening_hours: List[DaySchedule] = Field(default_factory=list)
-    pickup_window: List[DaySchedule] = Field(
-        default_factory=list, description="Fascia/e oraria/e di ritiro per il cliente"
-    )
+    opening_time: str = Field(..., description="Formato HH:MM (24h)")
+    pickup_window_start: str = Field(..., description="Formato HH:MM (24h)")
+    pickup_window_end: str = Field(..., description="Formato HH:MM (24h)")
 
     @field_validator("name")
     @classmethod
     def _check_name(cls, v: str) -> str:
         trimmed = v.strip()
-        if not (2 <= len(trimmed) <= 100):
-            raise ValueError("Il nome del negozio deve avere tra 2 e 100 caratteri.")
+        if not (2 <= len(trimmed) <= 50):  # varchar(50) in the DB
+            raise ValueError("Il nome del negozio deve avere tra 2 e 50 caratteri.")
         return trimmed
 
     @field_validator("address")
     @classmethod
     def _check_address(cls, v: str) -> str:
         trimmed = v.strip()
-        if not trimmed:
-            raise ValueError("L'indirizzo è obbligatorio.")
-        return trimmed
-
-    @field_validator("city")
-    @classmethod
-    def _check_city(cls, v: str) -> str:
-        trimmed = v.strip()
-        if not trimmed:
-            raise ValueError("La città è obbligatoria.")
+        if not trimmed or len(trimmed) > 100:  # varchar(100) in the DB
+            raise ValueError("L'indirizzo è obbligatorio e non può superare 100 caratteri.")
         return trimmed
 
     @field_validator("phone")
@@ -251,10 +206,16 @@ class ShopRequest(BaseModel):
             raise ValueError("Numero di telefono non valido.")
         return v.strip()
 
-    @field_validator("opening_hours", "pickup_window")
+    @field_validator("opening_time", "pickup_window_start", "pickup_window_end")
     @classmethod
-    def _check_schedules(cls, v: List[DaySchedule]) -> List[DaySchedule]:
-        return _check_no_duplicate_days(v)
+    def _check_time_format(cls, v: str) -> str:
+        return _validate_hhmm(v)
+
+    @model_validator(mode="after")
+    def _check_pickup_window_order(self) -> "ShopRequest":
+        if self.pickup_window_start >= self.pickup_window_end:
+            raise ValueError("La fascia di ritiro deve avere un orario di inizio precedente a quello di fine.")
+        return self
 
 
 class ShopPublic(BaseModel):
@@ -262,15 +223,14 @@ class ShopPublic(BaseModel):
     vendor_id: str
     name: str
     address: str
-    city: str
     lat: float
     lng: float
     phone: str
-    opening_hours: List[DaySchedule]
-    pickup_window: List[DaySchedule]
+    license_url: str
     license_status: LicenseStatus
-    created_at: datetime
-    updated_at: datetime
+    opening_time: str
+    pickup_window_start: str
+    pickup_window_end: str
     # Only populated by GET /shops when the request included lat/lng.
     distance_km: Optional[float] = None
 
