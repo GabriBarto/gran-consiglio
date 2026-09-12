@@ -13,23 +13,34 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..database import User, db, to_public_shop
 from ..dependencies import require_admin
-from ..schemas import LicenseStatus, ShopLicenseStatusUpdate, ShopPublic
+from ..schemas import AdminShopReview, LicenseStatus, ShopLicenseStatusUpdate, ShopPublic
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
-@router.get("/shops", response_model=List[ShopPublic])
+@router.get("/shops", response_model=List[AdminShopReview])
 def list_shops_for_review(
     review_status: Optional[LicenseStatus] = Query(
         None, alias="status", description="Filtra per stato (pending_review/approved/rejected)"
     ),
     admin: User = Depends(require_admin),
-) -> List[ShopPublic]:
+) -> List[AdminShopReview]:
     shops = db.list_shops()
     if review_status:
         shops = [s for s in shops if s.license_status == review_status]
     shops.sort(key=lambda s: s.created_at)
-    return [to_public_shop(s) for s in shops]
+
+    reviews = []
+    for shop in shops:
+        vendor = db.get_by_id(shop.vendor_id)
+        reviews.append(
+            AdminShopReview(
+                **to_public_shop(shop).model_dump(),
+                vendor_username=vendor.username if vendor else "(utente eliminato)",
+                vendor_email=vendor.email if vendor else "n/d",
+            )
+        )
+    return reviews
 
 
 @router.patch("/shops/{shop_id}/license-status", response_model=ShopPublic)

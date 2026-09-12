@@ -284,3 +284,16 @@ class ShopSearchResponse(BaseModel):
 
 class ShopLicenseStatusUpdate(BaseModel):
     status: LicenseStatus
+
+
+class AdminShopReview(ShopPublic):
+    """Same as ShopPublic, plus enough vendor identity for an admin to know
+    who they're approving/rejecting — ShopPublic only carries vendor_id,
+    which is meaningless in a review UI. Only ever returned by
+    GET /admin/shops (see routers/admin.py)."""
+
+    vendor_username: str
+    # Plain str (not EmailStr): this is just admin-facing display text, and
+    # falls back to a placeholder in the (currently impossible, since there
+    # is no user-deletion endpoint) case of a dangling vendor_id.
+    vendor_email: str

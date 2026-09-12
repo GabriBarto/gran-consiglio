@@ -32,7 +32,8 @@ export default function Login() {
     setIsSubmitting(true);
     try {
       const user = await login({ email, password });
-      router.replace(user.role === 'vendor' ? '/home-venditore' : '/home-cliente');
+      if (user.role === 'admin') router.replace('/admin');
+      else router.replace(user.role === 'vendor' ? '/home-venditore' : '/home-cliente');
     } catch (err) {
       setFormError(err.message);
     } finally {

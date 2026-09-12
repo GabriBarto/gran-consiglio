@@ -1,8 +1,7 @@
 import * as DocumentPicker from 'expo-document-picker';
 import { useRouter } from 'expo-router';
-import { useRef, useState } from 'react';
+import { useState } from 'react';
 import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
-import { isUsernameTaken } from '../src/api/auth';
 import FormField from '../src/components/FormField';
 import PrimaryButton from '../src/components/PrimaryButton';
 import { useAuth } from '../src/context/AuthContext';
@@ -25,7 +24,6 @@ export default function RegisterVenditore() {
   const [errors, setErrors] = useState({});
   const [formError, setFormError] = useState(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  const usernameCheckId = useRef(0);
 
   function setField(key, value) {
     setForm((prev) => ({ ...prev, [key]: value }));
@@ -41,16 +39,15 @@ export default function RegisterVenditore() {
     setErrors((prev) => ({ ...prev, license: undefined }));
   }
 
-  async function validate() {
+  // Only format/consistency checks happen client-side; email/username
+  // uniqueness is enforced server-side (no "check availability" endpoint,
+  // by design) — a duplicate surfaces as a 409 in formError on submit.
+  function validate() {
     const next = {};
     if (!isValidEmail(form.email)) next.email = 'Inserisci un indirizzo email valido.';
 
     const usernameError = validateUsername(form.username);
-    if (usernameError) {
-      next.username = usernameError;
-    } else if (await isUsernameTaken(form.username)) {
-      next.username = 'Questo nome utente è già in uso, scegline un altro (es. il nome del tuo negozio).';
-    }
+    if (usernameError) next.username = usernameError;
 
     const passwordError = validatePassword(form.password);
     if (passwordError) next.password = passwordError;
@@ -77,9 +74,7 @@ export default function RegisterVenditore() {
 
   async function handleSubmit() {
     setFormError(null);
-    const checkId = ++usernameCheckId.current;
-    const isValid = await validate();
-    if (checkId !== usernameCheckId.current || !isValid) return;
+    if (!validate()) return;
 
     setIsSubmitting(true);
     try {

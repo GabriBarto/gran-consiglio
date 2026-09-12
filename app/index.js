@@ -18,6 +18,7 @@ export default function Welcome() {
   // Already logged in: skip straight to the right home screen.
   if (user?.role === 'customer') return <Redirect href="/home-cliente" />;
   if (user?.role === 'vendor') return <Redirect href="/home-venditore" />;
+  if (user?.role === 'admin') return <Redirect href="/admin" />;
 
   return (
     <View style={styles.container}>

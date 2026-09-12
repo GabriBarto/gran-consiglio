@@ -1,11 +1,10 @@
 import { useRouter } from 'expo-router';
-import { useRef, useState } from 'react';
+import { useState } from 'react';
 import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
 import FormField from '../src/components/FormField';
 import PrimaryButton from '../src/components/PrimaryButton';
 import { useAuth } from '../src/context/AuthContext';
 import { colors, spacing } from '../src/theme';
-import { isUsernameTaken } from '../src/api/auth';
 import { isValidEmail, validatePassword, validateUsername } from '../src/validation';
 
 export default function RegisterCliente() {
@@ -16,14 +15,16 @@ export default function RegisterCliente() {
   const [errors, setErrors] = useState({});
   const [formError, setFormError] = useState(null);
   const [isSubmitting, setIsSubmitting] = useState(false);
-  // Guards against a stale "già in uso" result if the user keeps typing.
-  const usernameCheckId = useRef(0);
 
   function setField(key, value) {
     setForm((prev) => ({ ...prev, [key]: value }));
   }
 
-  async function validate() {
+  // Only format/consistency checks happen client-side; email/username
+  // uniqueness is enforced server-side (the backend deliberately has no
+  // "check availability" endpoint, to avoid leaking which accounts exist) —
+  // a duplicate surfaces as a 409 in formError on submit instead.
+  function validate() {
     const next = {};
     if (!isValidEmail(form.email)) next.email = 'Inserisci un indirizzo email valido.';
 
@@ -37,19 +38,13 @@ export default function RegisterCliente() {
       next.confirmPassword = 'Le password non coincidono.';
     }
 
-    if (!usernameError && (await isUsernameTaken(form.username))) {
-      next.username = 'Questo nome utente è già in uso, scegline un altro.';
-    }
-
     setErrors(next);
     return Object.keys(next).length === 0;
   }
 
   async function handleSubmit() {
     setFormError(null);
-    const checkId = ++usernameCheckId.current;
-    const isValid = await validate();
-    if (checkId !== usernameCheckId.current || !isValid) return;
+    if (!validate()) return;
 
     setIsSubmitting(true);
     try {
