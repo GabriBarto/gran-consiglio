@@ -1,8 +1,9 @@
 """
 Central app configuration, read from environment variables / a local .env
-file (see .env.example). Nothing here talks to a real external database or
-mail/storage provider by default — see database.py, email_utils.py and
-storage.py for the fake/mock implementations used until those are available.
+file (see .env.example). Users and shops are now persisted in a real MySQL
+(MariaDB-compatible) database — see backend/db/projectwork_en_v2.sql for the
+schema and app/db/ for the SQLAlchemy layer. Mail/storage remain
+fake/mock implementations for now — see email_utils.py and storage.py.
 """
 from __future__ import annotations
 
@@ -15,6 +16,12 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     app_name: str = "Gran Consiglio / TooGood API"
+
+    # MySQL/MariaDB connection. Default matches a stock local XAMPP install
+    # (root, no password, default port). Point this at a different server
+    # via the DATABASE_URL env var / .env — nothing else needs to change,
+    # see app/db/engine.py.
+    database_url: str = "mysql+pymysql://root:@127.0.0.1:3306/toogood"
 
     # WARNING: this default is for local development only. Always set a
     # real SECRET_KEY via environment variable (or .env, never committed)
@@ -37,9 +44,10 @@ class Settings(BaseSettings):
     smtp_from: str = "no-reply@toogood.example"
     smtp_use_tls: bool = True
 
-    # Fake object storage standing in for S3 / Google Cloud Storage until a
-    # real bucket is wired up (see storage.py). Files are written to disk
-    # here; only the resulting URL/metadata is ever stored on the "DB".
+    # Local-disk file storage for vendor license uploads (see storage.py).
+    # Real files, really served by this same API (mounted in main.py) —
+    # only self-hosted rather than a cloud bucket. Only the resulting
+    # URL/metadata is ever stored in the DB, never the file bytes.
     #
     # A relative value is resolved against the backend/ package directory
     # (see storage.py), NOT against the process's current working
@@ -47,9 +55,15 @@ class Settings(BaseSettings):
     # inside backend/, and this keeps the upload path identical either
     # way instead of silently nesting into backend/backend/... Pass an
     # absolute path here (env var) to point at a different location.
-    fake_storage_dir: str = "uploads/licenses"
-    fake_storage_base_url: str = "https://fake-bucket.local/licenses"
+    license_storage_dir: str = "uploads/licenses"
     max_license_size_mb: int = 10
+
+    # Where THIS API is publicly reachable from clients — used to build
+    # real, working URLs for files it serves itself (uploaded licenses).
+    # Keep in sync with EXPO_PUBLIC_API_BASE_URL in the frontend's own
+    # .env (project root): same backend, same address. Swap for your real
+    # domain (https://api.yourapp.com) once deployed.
+    public_base_url: str = "http://127.0.0.1:8000"
 
     # Used to build the links embedded in verification / reset emails.
     frontend_base_url: str = "http://localhost:8081"

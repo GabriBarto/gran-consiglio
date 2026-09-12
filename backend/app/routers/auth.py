@@ -14,7 +14,7 @@ from fastapi import APIRouter, File, Form, HTTPException, UploadFile, status
 
 from .. import email_utils, security, storage
 from ..config import settings
-from ..database import License, User, db, to_public_user
+from ..database import User, db, to_public_user
 from ..schemas import (
     ForgotPasswordRequest,
     LoginRequest,
@@ -47,10 +47,11 @@ def _start_email_verification(user: User) -> None:
     one can be used to complete verification."""
     token = security.create_email_verification_token(user.id)
     otp = security.generate_otp()
-    db.pending_verifications[user.id] = {
-        "otp": otp,
-        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=settings.email_verification_expire_minutes),
-    }
+    db.set_pending_verification(
+        user.id,
+        otp=otp,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=settings.email_verification_expire_minutes),
+    )
     email_utils.send_verification_email(to=user.email, token=token, otp=otp)
 
 
@@ -58,7 +59,11 @@ def _issue_token_pair(user: User) -> TokenPair:
     access = security.create_access_token(user.id)
     refresh = security.create_refresh_token(user.id)
     refresh_payload = security.decode_token(refresh, expected_purpose="refresh")
-    db.refresh_tokens[refresh_payload["jti"]] = {"user_id": user.id, "revoked": False}
+    db.create_refresh_token(
+        jti=refresh_payload["jti"],
+        user_id=user.id,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_expire_days),
+    )
     return TokenPair(access_token=access, refresh_token=refresh)
 
 
@@ -119,8 +124,6 @@ async def register_vendor(
             email=email,
             username=username,
             password_hash=security.hash_password(password),
-            phone=phone.strip(),
-            shop_address=shop_address.strip(),
         )
     except ValueError as exc:
         raise _uniqueness_error(exc)
@@ -134,16 +137,32 @@ async def register_vendor(
             data=data,
         )
     except storage.UploadRejected as exc:
-        # The account itself is created; only the license upload failed.
-        # Surface that clearly so the client can retry it separately
-        # (PUT /users/me/license) instead of losing the whole registration.
+        # The account itself is created; only the license upload (and thus
+        # the store) failed. Surface that clearly — the client can retry
+        # via POST /shops once they have a working file.
         raise HTTPException(
             status.HTTP_400_BAD_REQUEST,
             f"Account creato, ma il caricamento della licenza è fallito: {exc}",
         )
 
-    user.license = License(file_name=stored.file_name, content_type=stored.content_type, storage_url=stored.url)
-    db.save(user)
+    # The real schema ties the license to a `store` row, not to the user
+    # account (see backend/db/projectwork_en_v2.sql), so registering as a
+    # vendor creates a minimal placeholder store right away — using the
+    # phone/address collected here — so the license has somewhere to live.
+    # lat/lng and hours are unknown at this point; the vendor fills them in
+    # afterwards via PUT /shops/me.
+    db.create_shop(
+        vendor_id=user.id,
+        name=username.strip(),
+        address=shop_address.strip(),
+        lat=0.0,
+        lng=0.0,
+        phone=phone.strip(),
+        license_url=stored.url,
+        opening_time="09:00",
+        pickup_window_start="18:00",
+        pickup_window_end="19:00",
+    )
 
     _start_email_verification(user)
     return to_public_user(user)
@@ -165,7 +184,7 @@ def verify_email(payload: VerifyEmailRequest) -> MessageResponse:
         user = db.get_by_id(data["sub"])
     else:
         user = db.get_by_email(payload.email)
-        pending = db.pending_verifications.get(user.id) if user else None
+        pending = db.get_pending_verification(user.id) if user else None
         otp_valid = (
             pending is not None
             and pending["otp"] == payload.otp
@@ -179,7 +198,7 @@ def verify_email(payload: VerifyEmailRequest) -> MessageResponse:
 
     user.email_verified = True
     db.save(user)
-    db.pending_verifications.pop(user.id, None)
+    db.clear_pending_verification(user.id)
     return MessageResponse(message="Email verificata con successo.")
 
 
@@ -213,7 +232,7 @@ def refresh_token(payload: RefreshRequest) -> TokenPair:
     except ValueError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Refresh token non valido o scaduto.")
 
-    record = db.refresh_tokens.get(data["jti"])
+    record = db.get_refresh_token(data["jti"])
     if not record or record["revoked"]:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Refresh token non valido o già utilizzato.")
 
@@ -223,7 +242,7 @@ def refresh_token(payload: RefreshRequest) -> TokenPair:
 
     # Rotate: the old refresh token is single-use — invalidate it and hand
     # back a brand new access/refresh pair.
-    record["revoked"] = True
+    db.revoke_refresh_token(data["jti"])
     return _issue_token_pair(user)
 
 
@@ -237,7 +256,11 @@ def forgot_password(payload: ForgotPasswordRequest) -> MessageResponse:
     if user:
         token = security.create_password_reset_token(user.id)
         payload_claims = security.decode_token(token, expected_purpose="password_reset")
-        db.pending_resets[user.id] = {"jti": payload_claims["jti"]}
+        db.set_pending_reset(
+            user.id,
+            jti=payload_claims["jti"],
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=settings.password_reset_expire_minutes),
+        )
         email_utils.send_password_reset_email(to=user.email, token=token)
 
     # Same response regardless of whether the email exists, to avoid
@@ -253,11 +276,11 @@ def reset_password(payload: ResetPasswordRequest) -> MessageResponse:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Token non valido o scaduto.")
 
     user = db.get_by_id(data["sub"])
-    pending = db.pending_resets.get(user.id) if user else None
+    pending = db.get_pending_reset(user.id) if user else None
     if not user or not pending or pending["jti"] != data["jti"]:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Token non valido o già utilizzato.")
 
     user.password_hash = security.hash_password(payload.new_password)
     db.save(user)
-    db.pending_resets.pop(user.id, None)
+    db.clear_pending_reset(user.id)
     return MessageResponse(message="Password aggiornata con successo.")

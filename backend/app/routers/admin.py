@@ -13,34 +13,35 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..database import User, db, to_public_shop
 from ..dependencies import require_admin
-from ..schemas import AdminShopReview, LicenseStatus, ShopLicenseStatusUpdate, ShopPublic
+from ..schemas import AdminShopPublic, LicenseStatus, ShopLicenseStatusUpdate, ShopPublic
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
 
-@router.get("/shops", response_model=List[AdminShopReview])
+@router.get("/shops", response_model=List[AdminShopPublic])
 def list_shops_for_review(
     review_status: Optional[LicenseStatus] = Query(
         None, alias="status", description="Filtra per stato (pending_review/approved/rejected)"
     ),
     admin: User = Depends(require_admin),
-) -> List[AdminShopReview]:
-    shops = db.list_shops()
+) -> List[AdminShopPublic]:
+    shops = db.list_shops()  # already ordered by id (creation order)
     if review_status:
         shops = [s for s in shops if s.license_status == review_status]
-    shops.sort(key=lambda s: s.created_at)
 
-    reviews = []
+    result = []
     for shop in shops:
+        # FK-enforced (store.userId -> user.id ON DELETE CASCADE): a shop
+        # never outlives its vendor, so this is never None in practice.
         vendor = db.get_by_id(shop.vendor_id)
-        reviews.append(
-            AdminShopReview(
+        result.append(
+            AdminShopPublic(
                 **to_public_shop(shop).model_dump(),
-                vendor_username=vendor.username if vendor else "(utente eliminato)",
-                vendor_email=vendor.email if vendor else "n/d",
+                vendor_username=vendor.username if vendor else "—",
+                vendor_email=vendor.email if vendor else "—",
             )
         )
-    return reviews
+    return result
 
 
 @router.patch("/shops/{shop_id}/license-status", response_model=ShopPublic)
@@ -55,14 +56,4 @@ def set_shop_license_status(
 
     shop.license_status = payload.status
     db.save_shop(shop)
-
-    # Keep the owning vendor's account-level license.status (set at
-    # registration / upgrade-to-vendor time, see routers/auth.py and
-    # routers/users.py) in sync: it's the same real-world review,
-    # surfaced in two places for now until shops fully replace that field.
-    vendor = db.get_by_id(shop.vendor_id)
-    if vendor and vendor.license:
-        vendor.license.status = payload.status
-        db.save(vendor)
-
     return to_public_shop(shop)

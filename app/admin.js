@@ -139,7 +139,7 @@ export default function AdminPanel() {
               {item.vendor_username} · {item.vendor_email}
             </Text>
             <Text style={styles.cardMeta}>
-              {item.address}, {item.city} · 📞 {item.phone}
+              {item.address} · 📞 {item.phone}
             </Text>
             <Text style={styles.cardStatus}>{STATUS_LABEL[item.license_status]}</Text>
             <View style={styles.actionsRow}>

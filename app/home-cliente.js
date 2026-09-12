@@ -86,7 +86,10 @@ export default function HomeCliente() {
                 <Text style={styles.title}>Ciao, {user?.username}! 🪴</Text>
                 <Text style={styles.subtitle}>Trova vivai e fiorai vicino a te.</Text>
               </View>
-              <PrimaryButton title="Esci" variant="outline" onPress={handleLogout} />
+              <View style={styles.headerActions}>
+                <PrimaryButton title="I miei ordini 🧾" variant="outline" onPress={() => router.push('/orders')} />
+                <PrimaryButton title="Esci" variant="outline" onPress={handleLogout} style={styles.logoutButton} />
+              </View>
             </View>
 
             <View style={styles.searchRow}>
@@ -138,9 +141,7 @@ export default function HomeCliente() {
         renderItem={({ item }) => (
           <Pressable style={styles.card} onPress={() => router.push(`/shop/${item.id}`)}>
             <Text style={styles.cardName}>{item.name}</Text>
-            <Text style={styles.cardAddress}>
-              {item.address}, {item.city}
-            </Text>
+            <Text style={styles.cardAddress}>{item.address}</Text>
             <View style={styles.cardFooter}>
               <Text style={styles.cardPhone}>📞 {item.phone}</Text>
               {item.distance_km != null ? (
@@ -165,6 +166,8 @@ const styles = StyleSheet.create({
   },
   title: { fontSize: 20, fontWeight: '800', color: colors.text },
   subtitle: { fontSize: 14, color: colors.textMuted, marginTop: spacing.xs },
+  headerActions: { alignItems: 'flex-end' },
+  logoutButton: { marginTop: spacing.sm },
   searchRow: { flexDirection: 'row', gap: spacing.sm, alignItems: 'flex-start' },
   cityField: { flex: 1 },
   searchButton: { marginTop: spacing.md + 6, minWidth: 90 },

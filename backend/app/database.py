@@ -1,42 +1,102 @@
 """
-Fake in-memory "database" layer.
+Persistence layer.
 
-There is no real (external) database available yet, so this module keeps
-everything in process memory, seeded with a few fictitious demo accounts
-(see seed_fake_data()). Swap this module for a real persistence layer
-(PostgreSQL + SQLAlchemy/SQLModel, MongoDB, ...) before shipping — every
-other module only talks to the `db` object below and to to_public_user(), so
-the rest of the app should not need to change.
+Users and shops are real rows in MySQL (see backend/db/projectwork_en_v2.sql
+for the schema and app/db/models.py for the SQLAlchemy mapping) — this
+module used to hold an in-memory fake store; it's now a thin repository
+that translates between the app's Pydantic-facing vocabulary
+(customer/vendor/admin, pending_review/approved/rejected, string ids) and
+the DB's actual columns/enums (client/seller/admin, pending/approved/
+rejected, integer ids), so every router (auth.py, users.py, shops.py,
+admin.py) keeps talking to the same `db` object and dataclasses as before —
+only the internals changed.
 
-Note the license document itself is never stored here: only the metadata +
-storage URL returned by storage.py (see save_license_file). The binary file
-lives in the fake object store, mirroring how it would live in S3/Cloud
-Storage in production.
+Short-lived auth bookkeeping (pending email-verification OTPs,
+password-reset tokens, refresh-token revocation) is *also* real rows now
+(`refresh_token`/`email_verification`/`password_reset` — see
+app/db/models.py), not an in-process dict: a session or a pending
+verification now survives an API restart. A high-traffic production
+deployment would likely still move this specific slice to something like
+Redis (it's all TTL'd, high-churn data, unlike users/shops) — see the
+README — but nothing here is mock/in-memory bookkeeping anymore.
 """
 from __future__ import annotations
 
-import itertools
 import threading
-from dataclasses import dataclass, field
-from datetime import datetime, timezone
-from typing import Dict, Optional
+from dataclasses import dataclass
+from datetime import datetime, time as dt_time, timezone
+from decimal import Decimal
+from typing import List, Optional
 
-from .config import settings
-from .schemas import DaySchedule, LicenseInfo, LicenseStatus, ShopPublic, UserPublic, UserRole, Weekday
+from .db.engine import get_session
+from .db.models import (
+    BoxRow,
+    CartItemRow,
+    CartRow,
+    EmailVerificationRow,
+    OrderItemRow,
+    OrderRow,
+    PasswordResetRow,
+    RefreshTokenRow,
+    StoreRow,
+    UserRow,
+)
+from .schemas import (
+    BoxPublic,
+    CartItemPublic,
+    CartPublic,
+    LicenseStatus,
+    OrderItemPublic,
+    OrderPublic,
+    ShopPublic,
+    UserPublic,
+    UserRole,
+)
 from .validation import normalize_identifier
 
 
-def utcnow() -> datetime:
-    return datetime.now(timezone.utc)
+class InsufficientAvailabilityError(Exception):
+    """Raised at checkout when a cart item's quantity now exceeds the
+    box's current availability (someone else bought stock, or the vendor
+    lowered max_boxes, since it was added to the cart) — the whole
+    checkout is rejected atomically, nothing is partially booked."""
+
+    def __init__(self, box_name: str, available: int):
+        self.box_name = box_name
+        self.available = available
+        super().__init__(f"{box_name}: solo {available} disponibili")
+
+# App-level role/status vocabulary <-> DB enum values. The app (and the
+# frontend/tests built against it) keeps saying "customer"/"vendor" and
+# "pending_review" — the DB, per the given schema, says "client"/"seller"
+# and "pending". Translated here, at the single boundary between the two.
+_APP_ROLE_TO_DB = {UserRole.CUSTOMER: "client", UserRole.VENDOR: "seller", UserRole.ADMIN: "admin"}
+_DB_ROLE_TO_APP = {v: k for k, v in _APP_ROLE_TO_DB.items()}
+
+_APP_LICENSE_TO_DB = {
+    LicenseStatus.PENDING_REVIEW: "pending",
+    LicenseStatus.APPROVED: "approved",
+    LicenseStatus.REJECTED: "rejected",
+}
+_DB_LICENSE_TO_APP = {v: k for k, v in _APP_LICENSE_TO_DB.items()}
 
 
-@dataclass
-class License:
-    file_name: str
-    content_type: Optional[str]
-    storage_url: str
-    status: LicenseStatus = LicenseStatus.PENDING_REVIEW
-    uploaded_at: datetime = field(default_factory=utcnow)
+def _parse_hhmm(value: str) -> dt_time:
+    hours, minutes = value.split(":")
+    return dt_time(hour=int(hours), minute=int(minutes))
+
+
+def _format_hhmm(value: dt_time) -> str:
+    return value.strftime("%H:%M")
+
+
+def _as_utc(value: datetime) -> datetime:
+    """MySQL TIMESTAMP columns round-trip as naive datetimes via PyMySQL
+    (the value itself is UTC — TIMESTAMP is stored/compared as UTC
+    server-side — only the Python object loses the tzinfo). Everything in
+    this app treats these as UTC, so reattach it here, once, rather than at
+    every comparison call site."""
+    return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
 
 
 @dataclass
@@ -46,140 +106,660 @@ class User:
     email: str
     username: str
     password_hash: str
-    created_at: datetime = field(default_factory=utcnow)
+    created_at: datetime
     email_verified: bool = False
-    phone: Optional[str] = None
-    shop_address: Optional[str] = None
-    license: Optional[License] = None
 
 
 @dataclass
 class Shop:
-    """A vendor's storefront. One-to-one with a vendor User (id ==
-    vendor_id key in InMemoryDB._shop_by_vendor). license_status mirrors
-    the vendor's account-level license.status (see auth.py/users.py) but
-    is tracked independently here per the "shop management" requirements —
-    only an admin can change it (routers/admin.py), never the vendor."""
-
     id: str
     vendor_id: str
     name: str
     address: str
-    city: str
     lat: float
     lng: float
     phone: str
-    opening_hours: List[DaySchedule] = field(default_factory=list)
-    pickup_window: List[DaySchedule] = field(default_factory=list)
+    license_url: str
     license_status: LicenseStatus = LicenseStatus.PENDING_REVIEW
-    created_at: datetime = field(default_factory=utcnow)
-    updated_at: datetime = field(default_factory=utcnow)
+    opening_time: str = "09:00"
+    pickup_window_start: str = "18:00"
+    pickup_window_end: str = "19:00"
 
 
-class InMemoryDB:
-    """Thread-safe in-memory store standing in for the real database."""
+def _row_to_user(row: UserRow) -> User:
+    return User(
+        id=str(row.id),
+        role=_DB_ROLE_TO_APP[row.role],
+        email=row.email,
+        username=row.username,
+        password_hash=row.password_hash,
+        created_at=row.created_at,
+        email_verified=bool(row.email_verified),
+    )
+
+
+def _row_to_shop(row: StoreRow) -> Shop:
+    return Shop(
+        id=str(row.id),
+        vendor_id=str(row.vendor_id),
+        name=row.name,
+        address=row.address,
+        lat=float(row.latitude),
+        lng=float(row.longitude),
+        phone=row.phone,
+        license_url=row.license_url,
+        license_status=_DB_LICENSE_TO_APP[row.license_status],
+        opening_time=_format_hhmm(row.opening_time),
+        pickup_window_start=_format_hhmm(row.pickup_window_start),
+        pickup_window_end=_format_hhmm(row.pickup_window_end),
+    )
+
+
+@dataclass
+class Box:
+    id: str
+    shop_id: str
+    name: str
+    price: float
+    description: str
+    category: str
+    allergens: str
+    max_boxes: int
+    expire_at: datetime
+    created_at: datetime
+    pickup_window_start: str = "18:00"
+    pickup_window_end: str = "19:00"
+    sold_boxes: int = 0
+
+
+def _row_to_box(row: BoxRow) -> Box:
+    return Box(
+        id=str(row.id),
+        shop_id=str(row.shop_id),
+        name=row.name,
+        price=float(row.price),
+        description=row.description,
+        category=row.category,
+        allergens=row.allergens,
+        max_boxes=row.max_boxes,
+        sold_boxes=row.sold_boxes,
+        expire_at=_as_utc(row.expire_at),
+        created_at=_as_utc(row.created_at),
+        pickup_window_start=_format_hhmm(row.pickup_window_start),
+        pickup_window_end=_format_hhmm(row.pickup_window_end),
+    )
+
+
+class Repository:
+    """DB-backed repository for `user`/`store`/`box`, plus DB-backed
+    bookkeeping for short-lived auth tokens (see EmailVerificationRow/
+    PasswordResetRow/RefreshTokenRow in app/db/models.py)."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._users: Dict[str, User] = {}
-        self._email_index: Dict[str, str] = {}     # normalized email -> id
-        self._username_index: Dict[str, str] = {}  # normalized username -> id
-        self._id_counter = itertools.count(1)
 
-        self._shops: Dict[str, Shop] = {}
-        self._shop_by_vendor: Dict[str, str] = {}  # vendor_id -> shop_id
-        self._shop_id_counter = itertools.count(1)
+    # -- email verification ------------------------------------------------
+    def set_pending_verification(self, user_id: str, *, otp: str, expires_at: datetime) -> None:
+        """Replaces any existing pending verification for this user (a
+        resend invalidates the previous OTP, matching the old in-memory
+        behavior of simply overwriting the dict entry)."""
+        with get_session() as session:
+            row = session.get(EmailVerificationRow, int(user_id))
+            if row:
+                row.otp = otp
+                row.expires_at = expires_at
+            else:
+                session.add(EmailVerificationRow(user_id=int(user_id), otp=otp, expires_at=expires_at))
 
-        # Short-lived token/OTP bookkeeping. A real deployment would put
-        # this in a cache like Redis (with native TTL) rather than memory.
-        self.pending_verifications: Dict[str, dict] = {}  # user id -> {otp, expires_at}
-        self.pending_resets: Dict[str, dict] = {}          # user id -> {jti}
-        self.refresh_tokens: Dict[str, dict] = {}           # jti -> {user_id, revoked}
+    def get_pending_verification(self, user_id: str) -> Optional[dict]:
+        with get_session() as session:
+            row = session.get(EmailVerificationRow, int(user_id))
+            return {"otp": row.otp, "expires_at": _as_utc(row.expires_at)} if row else None
 
-    # -- lookups --------------------------------------------------------
+    def clear_pending_verification(self, user_id: str) -> None:
+        with get_session() as session:
+            row = session.get(EmailVerificationRow, int(user_id))
+            if row:
+                session.delete(row)
+
+    # -- password reset ------------------------------------------------
+    def set_pending_reset(self, user_id: str, *, jti: str, expires_at: datetime) -> None:
+        """Replaces any existing pending reset for this user — only the
+        most recently requested reset link/token is ever valid."""
+        with get_session() as session:
+            row = session.get(PasswordResetRow, int(user_id))
+            if row:
+                row.jti = jti
+                row.expires_at = expires_at
+            else:
+                session.add(PasswordResetRow(user_id=int(user_id), jti=jti, expires_at=expires_at))
+
+    def get_pending_reset(self, user_id: str) -> Optional[dict]:
+        with get_session() as session:
+            row = session.get(PasswordResetRow, int(user_id))
+            return {"jti": row.jti, "expires_at": _as_utc(row.expires_at)} if row else None
+
+    def clear_pending_reset(self, user_id: str) -> None:
+        with get_session() as session:
+            row = session.get(PasswordResetRow, int(user_id))
+            if row:
+                session.delete(row)
+
+    # -- refresh tokens ------------------------------------------------
+    def create_refresh_token(self, *, jti: str, user_id: str, expires_at: datetime) -> None:
+        with get_session() as session:
+            session.add(RefreshTokenRow(jti=jti, user_id=int(user_id), revoked=False, expires_at=expires_at))
+
+    def get_refresh_token(self, jti: str) -> Optional[dict]:
+        with get_session() as session:
+            row = session.query(RefreshTokenRow).filter(RefreshTokenRow.jti == jti).one_or_none()
+            return {"user_id": str(row.user_id), "revoked": row.revoked} if row else None
+
+    def revoke_refresh_token(self, jti: str) -> None:
+        with get_session() as session:
+            row = session.query(RefreshTokenRow).filter(RefreshTokenRow.jti == jti).one_or_none()
+            if row:
+                row.revoked = True
+
+    # -- users: lookups --------------------------------------------------
     def get_by_id(self, user_id: str) -> Optional[User]:
-        return self._users.get(user_id)
+        try:
+            uid = int(user_id)
+        except (TypeError, ValueError):
+            return None
+        with get_session() as session:
+            row = session.get(UserRow, uid)
+            return _row_to_user(row) if row else None
 
     def get_by_email(self, email: str) -> Optional[User]:
-        uid = self._email_index.get(normalize_identifier(email))
-        return self._users.get(uid) if uid else None
+        target = normalize_identifier(email)
+        with get_session() as session:
+            for row in session.query(UserRow).all():
+                if normalize_identifier(row.email) == target:
+                    return _row_to_user(row)
+        return None
 
     def get_by_username(self, username: str) -> Optional[User]:
-        uid = self._username_index.get(normalize_identifier(username))
-        return self._users.get(uid) if uid else None
+        target = normalize_identifier(username)
+        with get_session() as session:
+            for row in session.query(UserRow).all():
+                if normalize_identifier(row.username) == target:
+                    return _row_to_user(row)
+        return None
 
     def email_taken(self, email: str) -> bool:
-        return normalize_identifier(email) in self._email_index
+        return self.get_by_email(email) is not None
 
     def username_taken(self, username: str) -> bool:
-        return normalize_identifier(username) in self._username_index
+        return self.get_by_username(username) is not None
 
-    # -- mutations --------------------------------------------------------
-    def create_user(self, *, role: UserRole, email: str, username: str, password_hash: str, **extra) -> User:
+    # -- users: mutations --------------------------------------------------
+    def create_user(
+        self, *, role: UserRole, email: str, username: str, password_hash: str, email_verified: bool = False
+    ) -> User:
         with self._lock:
             if self.email_taken(email):
                 raise ValueError("email_taken")
             if self.username_taken(username):
                 raise ValueError("username_taken")
 
-            prefix = {UserRole.VENDOR: "vend", UserRole.ADMIN: "admin"}.get(role, "cust")
-            user_id = f"{prefix}_{next(self._id_counter)}"
-            user = User(
-                id=user_id,
-                role=role,
-                email=email.strip(),
-                username=username.strip(),
-                password_hash=password_hash,
-                **extra,
-            )
-            self._users[user_id] = user
-            self._email_index[normalize_identifier(email)] = user_id
-            self._username_index[normalize_identifier(username)] = user_id
-            return user
+            with get_session() as session:
+                row = UserRow(
+                    role=_APP_ROLE_TO_DB[role],
+                    email=email.strip(),
+                    username=username.strip(),
+                    password_hash=password_hash,
+                    email_verified=email_verified,
+                )
+                session.add(row)
+                session.flush()
+                session.refresh(row)
+                return _row_to_user(row)
 
     def save(self, user: User) -> None:
-        with self._lock:
-            self._users[user.id] = user
+        with get_session() as session:
+            row = session.get(UserRow, int(user.id))
+            if not row:
+                return
+            row.role = _APP_ROLE_TO_DB[user.role]
+            row.email = user.email
+            row.username = user.username
+            row.password_hash = user.password_hash
+            row.email_verified = user.email_verified
 
-    # -- shops --------------------------------------------------------
-    def create_shop(self, *, vendor_id: str, **fields) -> Shop:
-        with self._lock:
-            if vendor_id in self._shop_by_vendor:
-                raise ValueError("shop_exists")
-            shop_id = f"shop_{next(self._shop_id_counter)}"
-            shop = Shop(id=shop_id, vendor_id=vendor_id, **fields)
-            self._shops[shop_id] = shop
-            self._shop_by_vendor[vendor_id] = shop_id
-            return shop
-
+    # -- shops: lookups --------------------------------------------------
     def get_shop(self, shop_id: str) -> Optional[Shop]:
-        return self._shops.get(shop_id)
+        try:
+            sid = int(shop_id)
+        except (TypeError, ValueError):
+            return None
+        with get_session() as session:
+            row = session.get(StoreRow, sid)
+            return _row_to_shop(row) if row else None
 
     def get_shop_by_vendor(self, vendor_id: str) -> Optional[Shop]:
-        shop_id = self._shop_by_vendor.get(vendor_id)
-        return self._shops.get(shop_id) if shop_id else None
+        """A vendor may (per the seed data) own more than one store row —
+        the simple "my shop" endpoints (GET/PUT/DELETE /shops/me) operate
+        on their first/primary one (lowest id), deterministically."""
+        try:
+            vid = int(vendor_id)
+        except (TypeError, ValueError):
+            return None
+        with get_session() as session:
+            row = (
+                session.query(StoreRow)
+                .filter(StoreRow.vendor_id == vid)
+                .order_by(StoreRow.id.asc())
+                .first()
+            )
+            return _row_to_shop(row) if row else None
+
+    def list_shops(self) -> List[Shop]:
+        with get_session() as session:
+            rows = session.query(StoreRow).order_by(StoreRow.id.asc()).all()
+            return [_row_to_shop(row) for row in rows]
+
+    # -- shops: mutations --------------------------------------------------
+    def create_shop(
+        self,
+        *,
+        vendor_id: str,
+        name: str,
+        address: str,
+        lat: float,
+        lng: float,
+        phone: str,
+        license_url: str,
+        opening_time: str,
+        pickup_window_start: str,
+        pickup_window_end: str,
+        license_status: LicenseStatus = LicenseStatus.PENDING_REVIEW,
+    ) -> Shop:
+        with self._lock:
+            if self.get_shop_by_vendor(vendor_id):
+                raise ValueError("shop_exists")
+
+            with get_session() as session:
+                row = StoreRow(
+                    vendor_id=int(vendor_id),
+                    name=name,
+                    address=address,
+                    latitude=Decimal(str(lat)),
+                    longitude=Decimal(str(lng)),
+                    phone=phone,
+                    license_url=license_url,
+                    license_status=_APP_LICENSE_TO_DB[license_status],
+                    opening_time=_parse_hhmm(opening_time),
+                    pickup_window_start=_parse_hhmm(pickup_window_start),
+                    pickup_window_end=_parse_hhmm(pickup_window_end),
+                )
+                session.add(row)
+                session.flush()
+                session.refresh(row)
+                return _row_to_shop(row)
 
     def save_shop(self, shop: Shop) -> None:
-        with self._lock:
-            shop.updated_at = utcnow()
-            self._shops[shop.id] = shop
+        with get_session() as session:
+            row = session.get(StoreRow, int(shop.id))
+            if not row:
+                return
+            row.name = shop.name
+            row.address = shop.address
+            row.latitude = Decimal(str(shop.lat))
+            row.longitude = Decimal(str(shop.lng))
+            row.phone = shop.phone
+            row.license_url = shop.license_url
+            row.license_status = _APP_LICENSE_TO_DB[shop.license_status]
+            row.opening_time = _parse_hhmm(shop.opening_time)
+            row.pickup_window_start = _parse_hhmm(shop.pickup_window_start)
+            row.pickup_window_end = _parse_hhmm(shop.pickup_window_end)
 
     def delete_shop(self, shop_id: str) -> None:
-        with self._lock:
-            shop = self._shops.pop(shop_id, None)
-            if shop:
-                self._shop_by_vendor.pop(shop.vendor_id, None)
+        with get_session() as session:
+            row = session.get(StoreRow, int(shop_id))
+            if row:
+                session.delete(row)
 
-    def list_shops(self) -> list[Shop]:
-        return list(self._shops.values())
+    # -- boxes: lookups --------------------------------------------------
+    def get_box(self, box_id: str) -> Optional[Box]:
+        try:
+            bid = int(box_id)
+        except (TypeError, ValueError):
+            return None
+        with get_session() as session:
+            row = session.get(BoxRow, bid)
+            return _row_to_box(row) if row else None
+
+    def list_boxes_by_shop(self, shop_id: str) -> List[Box]:
+        with get_session() as session:
+            rows = (
+                session.query(BoxRow)
+                .filter(BoxRow.shop_id == int(shop_id))
+                .order_by(BoxRow.id.asc())
+                .all()
+            )
+            return [_row_to_box(row) for row in rows]
+
+    # -- boxes: mutations --------------------------------------------------
+    def create_box(
+        self,
+        *,
+        shop_id: str,
+        name: str,
+        price: float,
+        description: str,
+        category: str,
+        allergens: str,
+        max_boxes: int,
+        pickup_window_start: str,
+        pickup_window_end: str,
+        expire_at: datetime,
+    ) -> Box:
+        with get_session() as session:
+            row = BoxRow(
+                shop_id=int(shop_id),
+                name=name,
+                price=price,
+                description=description,
+                category=category,
+                allergens=allergens,
+                max_boxes=max_boxes,
+                sold_boxes=0,
+                pickup_window_start=_parse_hhmm(pickup_window_start),
+                pickup_window_end=_parse_hhmm(pickup_window_end),
+                expire_at=expire_at,
+            )
+            session.add(row)
+            session.flush()
+            session.refresh(row)
+            return _row_to_box(row)
+
+    def save_box(self, box: Box) -> None:
+        """Updates the vendor-editable fields only — sold_boxes is
+        intentionally never written here (see routers/boxes.py)."""
+        with get_session() as session:
+            row = session.get(BoxRow, int(box.id))
+            if not row:
+                return
+            row.name = box.name
+            row.price = box.price
+            row.description = box.description
+            row.category = box.category
+            row.allergens = box.allergens
+            row.max_boxes = box.max_boxes
+            row.pickup_window_start = _parse_hhmm(box.pickup_window_start)
+            row.pickup_window_end = _parse_hhmm(box.pickup_window_end)
+            row.expire_at = box.expire_at
+
+    def delete_box(self, box_id: str) -> None:
+        with get_session() as session:
+            row = session.get(BoxRow, int(box_id))
+            if row:
+                session.delete(row)
+
+    # -- cart ---------------------------------------------------------
+    def _active_cart(self, session, *, user_id: str, shop_id: str) -> Optional[CartRow]:
+        return (
+            session.query(CartRow)
+            .filter(CartRow.user_id == int(user_id), CartRow.shop_id == int(shop_id), CartRow.status == "active")
+            .one_or_none()
+        )
+
+    def _cart_public(self, session, *, shop_id: str, cart: Optional[CartRow]) -> CartPublic:
+        shop = session.get(StoreRow, int(shop_id))
+        items: List[CartItemPublic] = []
+        if cart:
+            for item in session.query(CartItemRow).filter(CartItemRow.cart_id == cart.id).all():
+                box = session.get(BoxRow, item.box_id)
+                if not box:  # ON DELETE CASCADE keeps this from actually happening
+                    continue
+                items.append(
+                    CartItemPublic(
+                        box_id=str(box.id),
+                        box_name=box.name,
+                        unit_price=float(box.price),
+                        quantity=item.quantity,
+                        subtotal=round(float(box.price) * item.quantity, 2),
+                        available=max(box.max_boxes - box.sold_boxes, 0),
+                    )
+                )
+        return CartPublic(
+            shop_id=str(shop_id),
+            shop_name=shop.name if shop else "",
+            items=items,
+            total_price=round(sum(i.subtotal for i in items), 2),
+        )
+
+    def get_cart(self, *, user_id: str, shop_id: str) -> CartPublic:
+        with get_session() as session:
+            return self._cart_public(session, shop_id=shop_id, cart=self._active_cart(session, user_id=user_id, shop_id=shop_id))
+
+    def add_to_cart(self, *, user_id: str, shop_id: str, box_id: str, quantity: int) -> CartPublic:
+        with get_session() as session:
+            box = session.get(BoxRow, int(box_id))
+            if not box or box.shop_id != int(shop_id):
+                raise ValueError("box_not_found")
+
+            cart = self._active_cart(session, user_id=user_id, shop_id=shop_id)
+            if not cart:
+                cart = CartRow(user_id=int(user_id), shop_id=int(shop_id), status="active")
+                session.add(cart)
+                session.flush()
+
+            item = (
+                session.query(CartItemRow)
+                .filter(CartItemRow.cart_id == cart.id, CartItemRow.box_id == int(box_id))
+                .one_or_none()
+            )
+            if item:
+                item.quantity += quantity
+            else:
+                session.add(CartItemRow(cart_id=cart.id, box_id=int(box_id), quantity=quantity))
+            session.flush()
+            return self._cart_public(session, shop_id=shop_id, cart=cart)
+
+    def set_cart_item_quantity(self, *, user_id: str, shop_id: str, box_id: str, quantity: int) -> CartPublic:
+        with get_session() as session:
+            cart = self._active_cart(session, user_id=user_id, shop_id=shop_id)
+            item = (
+                session.query(CartItemRow)
+                .filter(CartItemRow.cart_id == cart.id, CartItemRow.box_id == int(box_id))
+                .one_or_none()
+                if cart
+                else None
+            )
+            if not item:
+                raise ValueError("item_not_found")
+            item.quantity = quantity
+            session.flush()
+            return self._cart_public(session, shop_id=shop_id, cart=cart)
+
+    def remove_cart_item(self, *, user_id: str, shop_id: str, box_id: str) -> CartPublic:
+        with get_session() as session:
+            cart = self._active_cart(session, user_id=user_id, shop_id=shop_id)
+            if cart:
+                item = (
+                    session.query(CartItemRow)
+                    .filter(CartItemRow.cart_id == cart.id, CartItemRow.box_id == int(box_id))
+                    .one_or_none()
+                )
+                if item:
+                    session.delete(item)
+                    # autoflush is off (see db/engine.py) — without this,
+                    # the re-query just below (in _cart_public) wouldn't
+                    # see the pending delete yet.
+                    session.flush()
+            return self._cart_public(session, shop_id=shop_id, cart=cart)
+
+    def clear_cart(self, *, user_id: str, shop_id: str) -> None:
+        with get_session() as session:
+            cart = self._active_cart(session, user_id=user_id, shop_id=shop_id)
+            if cart:
+                session.delete(cart)  # cascades to its items (relationship cascade)
+
+    # -- checkout / orders ------------------------------------------------
+    def checkout_cart(self, *, user_id: str, shop_id: str) -> OrderPublic:
+        with get_session() as session:
+            cart = self._active_cart(session, user_id=user_id, shop_id=shop_id)
+            if not cart:
+                raise ValueError("cart_not_found")
+            cart_items = session.query(CartItemRow).filter(CartItemRow.cart_id == cart.id).all()
+            if not cart_items:
+                raise ValueError("cart_empty")
+
+            # Lock and validate every box up front, before creating
+            # anything: if any item is no longer available in the
+            # requested quantity, the whole checkout fails atomically
+            # (get_session() rolls back on any raised exception) rather
+            # than partially booking the cart.
+            locked_boxes: dict[int, BoxRow] = {}
+            for item in cart_items:
+                box = session.query(BoxRow).filter(BoxRow.id == item.box_id).with_for_update().one_or_none()
+                if not box:
+                    raise ValueError("box_not_found")
+                available = box.max_boxes - box.sold_boxes
+                if item.quantity > available:
+                    raise InsufficientAvailabilityError(box.name, available)
+                locked_boxes[item.box_id] = box
+
+            # orders.pickupWindow is one varchar(20), not per-item — a cart
+            # mixing boxes with different windows (e.g. a bakery's morning
+            # bread and evening pastries) collapses to the widest span that
+            # covers all of them, "HH:MM-HH:MM" (always well under 20
+            # chars). Simple and always representable, if occasionally
+            # wider than any single item's own window.
+            starts = [locked_boxes[i.box_id].pickup_window_start for i in cart_items]
+            ends = [locked_boxes[i.box_id].pickup_window_end for i in cart_items]
+            pickup_window = f"{_format_hhmm(min(starts))}-{_format_hhmm(max(ends))}"
+
+            order = OrderRow(
+                user_id=int(user_id),
+                shop_id=int(shop_id),
+                total_price=0.0,
+                state="booked",
+                pickup_window=pickup_window,
+            )
+            session.add(order)
+            session.flush()
+
+            total = 0.0
+            for item in cart_items:
+                box = locked_boxes[item.box_id]
+                box.sold_boxes += item.quantity
+                unit_price = float(box.price)
+                session.add(
+                    OrderItemRow(order_id=order.id, box_id=box.id, quantity=item.quantity, unit_price=unit_price)
+                )
+                total += unit_price * item.quantity
+
+            order.total_price = round(total, 2)
+            cart.status = "completed"
+            session.flush()
+            return self._order_public(session, order)
+
+    def _order_public(self, session, order: OrderRow) -> OrderPublic:
+        shop = session.get(StoreRow, order.shop_id)
+        items = []
+        for item in session.query(OrderItemRow).filter(OrderItemRow.order_id == order.id).all():
+            # No ON DELETE CASCADE on order_item.boxId (see app/db/models.py)
+            # — a box that has ever been ordered can't actually be deleted,
+            # so this is never None in practice.
+            box = session.get(BoxRow, item.box_id)
+            items.append(
+                OrderItemPublic(
+                    box_id=str(item.box_id),
+                    box_name=box.name if box else "—",
+                    quantity=item.quantity,
+                    unit_price=float(item.unit_price),
+                    subtotal=round(float(item.unit_price) * item.quantity, 2),
+                )
+            )
+        return OrderPublic(
+            id=str(order.id),
+            shop_id=str(order.shop_id),
+            shop_name=shop.name if shop else "",
+            total_price=float(order.total_price),
+            order_date=_as_utc(order.order_date),
+            state=order.state,
+            pickup_window=order.pickup_window,
+            items=items,
+        )
+
+    def get_order(self, order_id: str) -> Optional[OrderPublic]:
+        try:
+            oid = int(order_id)
+        except (TypeError, ValueError):
+            return None
+        with get_session() as session:
+            order = session.get(OrderRow, oid)
+            return self._order_public(session, order) if order else None
+
+    def get_order_owner_ids(self, order_id: str) -> Optional[tuple[str, str]]:
+        """(customer_user_id, shop_id) for the given order, for routers to
+        run ownership checks without building the full public shape."""
+        try:
+            oid = int(order_id)
+        except (TypeError, ValueError):
+            return None
+        with get_session() as session:
+            order = session.get(OrderRow, oid)
+            return (str(order.user_id), str(order.shop_id)) if order else None
+
+    def list_orders_for_user(self, user_id: str) -> List[OrderPublic]:
+        with get_session() as session:
+            orders = (
+                session.query(OrderRow)
+                .filter(OrderRow.user_id == int(user_id))
+                .order_by(OrderRow.order_date.desc())
+                .all()
+            )
+            return [self._order_public(session, o) for o in orders]
+
+    def list_orders_for_shop(self, shop_id: str) -> List[OrderPublic]:
+        with get_session() as session:
+            orders = (
+                session.query(OrderRow)
+                .filter(OrderRow.shop_id == int(shop_id))
+                .order_by(OrderRow.order_date.desc())
+                .all()
+            )
+            return [self._order_public(session, o) for o in orders]
+
+    def cancel_order(self, order_id: str) -> OrderPublic:
+        """Customer- or vendor-initiated cancellation of a still-booked
+        order: restocks every item back onto its box (sold_boxes -= qty,
+        floored at 0) before flipping the order to 'cancelled'."""
+        with get_session() as session:
+            order = session.get(OrderRow, int(order_id))
+            if not order:
+                raise ValueError("order_not_found")
+            if order.state != "booked":
+                raise ValueError("not_cancellable")
+            for item in session.query(OrderItemRow).filter(OrderItemRow.order_id == order.id).all():
+                box = session.query(BoxRow).filter(BoxRow.id == item.box_id).with_for_update().one_or_none()
+                if box:
+                    box.sold_boxes = max(box.sold_boxes - item.quantity, 0)
+            order.state = "cancelled"
+            session.flush()
+            return self._order_public(session, order)
+
+    def mark_order_picked_up(self, order_id: str) -> OrderPublic:
+        with get_session() as session:
+            order = session.get(OrderRow, int(order_id))
+            if not order:
+                raise ValueError("order_not_found")
+            if order.state != "booked":
+                raise ValueError("not_pickupable")
+            order.state = "pickedUp"
+            session.flush()
+            return self._order_public(session, order)
 
 
-db = InMemoryDB()
+db = Repository()
 
 
 def to_public_user(user: User) -> UserPublic:
-    """Never expose the password hash (or raw storage internals) to API
-    responses — mirrors toPublicUser() in the JS mock."""
+    """Never expose the password hash to API responses."""
     return UserPublic(
         id=user.id,
         role=user.role,
@@ -187,18 +767,6 @@ def to_public_user(user: User) -> UserPublic:
         username=user.username,
         email_verified=user.email_verified,
         created_at=user.created_at,
-        phone=user.phone,
-        shop_address=user.shop_address,
-        license=(
-            LicenseInfo(
-                file_name=user.license.file_name,
-                content_type=user.license.content_type,
-                status=user.license.status,
-                uploaded_at=user.license.uploaded_at,
-            )
-            if user.license
-            else None
-        ),
     )
 
 
@@ -208,118 +776,32 @@ def to_public_shop(shop: Shop, *, distance_km: Optional[float] = None) -> ShopPu
         vendor_id=shop.vendor_id,
         name=shop.name,
         address=shop.address,
-        city=shop.city,
         lat=shop.lat,
         lng=shop.lng,
         phone=shop.phone,
-        opening_hours=shop.opening_hours,
-        pickup_window=shop.pickup_window,
+        license_url=shop.license_url,
         license_status=shop.license_status,
-        created_at=shop.created_at,
-        updated_at=shop.updated_at,
+        opening_time=shop.opening_time,
+        pickup_window_start=shop.pickup_window_start,
+        pickup_window_end=shop.pickup_window_end,
         distance_km=round(distance_km, 3) if distance_km is not None else None,
     )
 
 
-_WEEK_ORDER = [Weekday.MON, Weekday.TUE, Weekday.WED, Weekday.THU, Weekday.FRI, Weekday.SAT, Weekday.SUN]
-
-
-def _weekly_schedule(open_time: str, close_time: str, closed_days: tuple = ()) -> list[DaySchedule]:
-    """Small helper to build a full Mon-Sun DaySchedule list for seed data
-    without repeating each day by hand."""
-    return [
-        DaySchedule(day=day, closed=True) if day in closed_days else DaySchedule(day=day, start=open_time, end=close_time)
-        for day in _WEEK_ORDER
-    ]
-
-
-def seed_fake_data() -> None:
-    """Seeds a couple of fictitious accounts for local testing/demo purposes,
-    since there is no real external database yet. These are throwaway fake
-    credentials, not a security concern — never do this against a real DB."""
-    if db.get_by_email("cliente.demo@example.com"):
-        return  # already seeded (e.g. `--reload` triggered a re-run)
-
-    from . import security  # local import to avoid import-order surprises
-
-    customer = db.create_user(
-        role=UserRole.CUSTOMER,
-        email="cliente.demo@example.com",
-        username="Cliente Demo",
-        password_hash=security.hash_password("Password123"),
-    )
-    customer.email_verified = True
-    db.save(customer)
-
-    vendor = db.create_user(
-        role=UserRole.VENDOR,
-        email="vivaio.rossi@example.com",
-        username="Vivaio Rossi",
-        password_hash=security.hash_password("Password123"),
-        phone="+39 333 1234567",
-        shop_address="Via delle Rose 12, Firenze",
-    )
-    vendor.email_verified = True
-    vendor.license = License(
-        file_name="licenza_vivaio_rossi.pdf",
-        content_type="application/pdf",
-        storage_url=f"{settings.fake_storage_base_url}/demo-licenza-approvata.pdf",
-        status=LicenseStatus.APPROVED,
-    )
-    db.save(vendor)
-
-    pending_vendor = db.create_user(
-        role=UserRole.VENDOR,
-        email="ortofrutta.bianchi@example.com",
-        username="Ortofrutta Bianchi",
-        password_hash=security.hash_password("Password123"),
-        phone="+39 347 7654321",
-        shop_address="Corso Italia 5, Bologna",
-    )
-    pending_vendor.email_verified = True
-    pending_vendor.license = License(
-        file_name="licenza_ortofrutta_bianchi.pdf",
-        content_type="application/pdf",
-        storage_url=f"{settings.fake_storage_base_url}/demo-licenza-pending.pdf",
-        status=LicenseStatus.PENDING_REVIEW,
-    )
-    db.save(pending_vendor)
-
-    admin = db.create_user(
-        role=UserRole.ADMIN,
-        email="admin@example.com",
-        username="Admin",
-        password_hash=security.hash_password("Password123"),
-    )
-    admin.email_verified = True
-    db.save(admin)
-
-    # Two demo shops, one per seeded vendor, so /shops and /admin/shops are
-    # exercisable out of the box: one already approved (shows up in public
-    # search), one still pending_review (only visible to its owner/admin,
-    # and to be found in the admin review queue).
-    db.create_shop(
-        vendor_id=vendor.id,
-        name="Vivaio Rossi",
-        address="Via delle Rose 12",
-        city="Firenze",
-        lat=43.7696,
-        lng=11.2558,
-        phone=vendor.phone,
-        opening_hours=_weekly_schedule("08:00", "19:30", closed_days=(Weekday.SUN,)),
-        pickup_window=_weekly_schedule("18:30", "19:30", closed_days=(Weekday.SUN,)),
-        license_status=LicenseStatus.APPROVED,
-    )
-
-    db.create_shop(
-        vendor_id=pending_vendor.id,
-        name="Ortofrutta Bianchi",
-        address="Corso Italia 5",
-        city="Bologna",
-        lat=44.4949,
-        lng=11.3426,
-        phone=pending_vendor.phone,
-        opening_hours=_weekly_schedule("07:30", "13:30", closed_days=(Weekday.SUN,)),
-        pickup_window=_weekly_schedule("12:30", "13:30", closed_days=(Weekday.SUN,)),
-        license_status=LicenseStatus.PENDING_REVIEW,
+def to_public_box(box: Box) -> BoxPublic:
+    return BoxPublic(
+        id=box.id,
+        shop_id=box.shop_id,
+        name=box.name,
+        price=box.price,
+        description=box.description,
+        category=box.category,
+        allergens=box.allergens,
+        max_boxes=box.max_boxes,
+        sold_boxes=box.sold_boxes,
+        available=max(box.max_boxes - box.sold_boxes, 0),
+        pickup_window_start=box.pickup_window_start,
+        pickup_window_end=box.pickup_window_end,
+        expire_at=box.expire_at,
+        created_at=box.created_at,
     )

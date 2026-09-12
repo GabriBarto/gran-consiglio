@@ -5,24 +5,14 @@
 // registerCustomer/registerVendor log in right after, to keep the existing
 // UX where "registrati" leaves you already logged in.
 // ---------------------------------------------------------------------------
-import { File } from 'expo-file-system';
 import { apiRequest, clearTokens, hasStoredSession, storeTokens } from './client';
+import { toUploadFile } from '../utils/files';
 
-// Expo SDK 57 makes the WinterCG-compliant `expo/fetch` the global fetch
-// (see docs.expo.dev/versions/v57.0.0/sdk/expo — "On native platforms... the
-// expo/fetch implementation becomes the global fetch by default"). Its
-// FormData is spec-compliant and only knows how to send actual Blob/File
-// parts — the classic React Native trick of appending a plain
-// { uri, name, type } object (which only the old bridge's Networking module
-// understood) is silently rejected, so the request never leaves the device.
-// expo-file-system's File class implements Blob and works with it directly.
-function toUploadFile(pickedDocument) {
-  return new File(pickedDocument.uri);
-}
-
-// Backend field names (snake_case, license nested) -> the flatter shape the
-// screens already use (see the old mock in git history for the shape this
-// mirrors).
+// Backend field names (snake_case) -> camelCase, and only the fields
+// UserPublic actually has (backend/app/schemas.py) — phone/address/license
+// used to live on the user in an earlier version of this API but now live
+// on the shop instead (see src/api/shops.js), since the real DB schema
+// ties them to `store`, not `user`.
 function mapUser(user) {
   if (!user) return null;
   return {
@@ -31,10 +21,6 @@ function mapUser(user) {
     email: user.email,
     username: user.username,
     emailVerified: user.email_verified,
-    phone: user.phone ?? null,
-    shopAddress: user.shop_address ?? null,
-    license: user.license ?? null,
-    licenseStatus: user.license?.status ?? null,
     createdAt: user.created_at,
   };
 }
@@ -90,12 +76,5 @@ export async function getSessionUser() {
 
 export async function refreshUser() {
   const user = await apiRequest('/users/me', { auth: true });
-  return mapUser(user);
-}
-
-export async function reuploadLicense(license) {
-  const form = new FormData();
-  form.append('license_file', toUploadFile(license), license.name ?? 'licenza');
-  const user = await apiRequest('/users/me/license', { method: 'PUT', auth: true, form });
   return mapUser(user);
 }

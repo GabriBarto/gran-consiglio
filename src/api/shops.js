@@ -1,11 +1,13 @@
 // ---------------------------------------------------------------------------
 // Shop (vendor storefront) endpoints — backend/app/routers/shops.py.
 //
-// Shapes are passed through as the backend returns them (snake_case:
-// opening_hours, pickup_window, license_status, vendor_id, ...) since these
-// are new screens with no legacy naming to stay compatible with.
+// Field names match backend/app/schemas.py::ShopRequest/ShopPublic exactly:
+// a single daily opening_time, a single daily pickup_window_start/end (not
+// a per-weekday schedule — the real DB schema doesn't model that), and a
+// free-text address (no separate city column).
 // ---------------------------------------------------------------------------
 import { apiRequest } from './client';
+import { toUploadFile } from '../utils/files';
 
 function buildQuery(params) {
   const query = new URLSearchParams();
@@ -31,10 +33,34 @@ export async function getMyShop() {
   return apiRequest('/shops/me', { auth: true, nullOnStatus: [404] });
 }
 
-export async function createShop(payload) {
-  return apiRequest('/shops', { method: 'POST', auth: true, json: payload });
+// Creates the vendor's shop from scratch — most vendors never call this
+// (registering already auto-creates a placeholder shop, see
+// backend/app/routers/auth.py), only reachable if that one was somehow
+// deleted. Unlike updateMyShop, the backend requires multipart here (a
+// license file is mandatory), so `licenseFile` (an expo-document-picker
+// asset) is required.
+export async function createShop({ licenseFile, ...fields }) {
+  const form = new FormData();
+  form.append('name', fields.name);
+  form.append('address', fields.address);
+  form.append('lat', String(fields.lat));
+  form.append('lng', String(fields.lng));
+  form.append('phone', fields.phone);
+  form.append('opening_time', fields.opening_time);
+  form.append('pickup_window_start', fields.pickup_window_start);
+  form.append('pickup_window_end', fields.pickup_window_end);
+  form.append('license_file', toUploadFile(licenseFile), licenseFile.name ?? 'licenza');
+  return apiRequest('/shops', { method: 'POST', auth: true, form });
 }
 
 export async function updateMyShop(payload) {
   return apiRequest('/shops/me', { method: 'PUT', auth: true, json: payload });
+}
+
+// Lets a vendor (re)upload their license document (e.g. after a rejection)
+// — this resets the shop's license_status to pending_review server-side.
+export async function replaceLicense(licenseFile) {
+  const form = new FormData();
+  form.append('license_file', toUploadFile(licenseFile), licenseFile.name ?? 'licenza');
+  return apiRequest('/shops/me/license', { method: 'PUT', auth: true, form });
 }
