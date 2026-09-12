@@ -32,6 +32,15 @@ yarn-error.*
 
 # local env files
 .env*.local
+.env
+
+# Python backend (backend/.gitignore has more, this is belt-and-suspenders)
+backend/.venv/
+backend/uploads/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
 
 # typescript
 *.tsbuildinfo
