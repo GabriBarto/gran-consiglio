@@ -54,6 +54,12 @@ from .schemas import (
 )
 from .validation import normalize_identifier
 
+# App-level role/status vocabulary <-> DB enum values. The app (and the
+# frontend/tests built against it) keeps saying "customer"/"vendor" and
+# "pending_review" — the DB, per the given schema, says "client"/"seller"
+# and "pending". Translated here, at the single boundary between the two.
+_APP_ROLE_TO_DB = {UserRole.CUSTOMER: "client", UserRole.VENDOR: "seller", UserRole.ADMIN: "admin"}
+_DB_ROLE_TO_APP = {v: k for k, v in _APP_ROLE_TO_DB.items()}
 
 class InsufficientAvailabilityError(Exception):
     """Raised at checkout when a cart item's quantity now exceeds the

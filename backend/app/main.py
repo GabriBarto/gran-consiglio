@@ -24,6 +24,8 @@ from .routers import admin, auth, boxes, cart, orders, shops, users
 
 logger = logging.getLogger("toogood.startup")
 
+logger = logging.getLogger("toogood.startup")
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
