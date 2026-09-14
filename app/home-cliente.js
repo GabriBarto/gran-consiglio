@@ -1,8 +1,9 @@
 import * as Location from 'expo-location';
 import { useRouter } from 'expo-router';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import { listNotifications } from '../src/api/notifications';
 import { searchShops } from '../src/api/shops';
 import FormField from '../src/components/FormField';
 import PrimaryButton from '../src/components/PrimaryButton';
@@ -23,6 +24,13 @@ export default function HomeCliente() {
   const [isLocating, setIsLocating] = useState(false);
   const [error, setError] = useState(null);
   const [hasSearched, setHasSearched] = useState(false);
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  useEffect(() => {
+    listNotifications()
+      .then((items) => setUnreadCount(items.filter((n) => !n.is_read).length))
+      .catch(() => {}); // non-fatal: the rest of the screen works without this
+  }, []);
 
   async function runSearch({ withCoords = coords, withRadius = radiusKm } = {}) {
     setError(null);
@@ -88,6 +96,12 @@ export default function HomeCliente() {
               </View>
               <View style={styles.headerActions}>
                 <PrimaryButton title="I miei ordini 🧾" variant="outline" onPress={() => router.push('/orders')} />
+                <PrimaryButton
+                  title={unreadCount > 0 ? `Notifiche 🔔 (${unreadCount})` : 'Notifiche 🔔'}
+                  variant="outline"
+                  onPress={() => router.push('/notifications')}
+                  style={styles.logoutButton}
+                />
                 <PrimaryButton title="Esci" variant="outline" onPress={handleLogout} style={styles.logoutButton} />
               </View>
             </View>

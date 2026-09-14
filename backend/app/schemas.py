@@ -366,7 +366,16 @@ class CartPublic(BaseModel):
 # ---------------------------------------------------------------------------
 
 class OrderState(str, Enum):
-    BOOKED = "booked"
+    """Full order lifecycle — see app/order_state_machine.py for the valid
+    transitions between these and app/order_events.py for the side effects
+    each one triggers. `pending_payment` and `paid` replace the old single
+    `booked` (checkout used to skip a payment step entirely);
+    `ready_for_pickup` is new too, between the vendor preparing the box and
+    the customer collecting it."""
+
+    PENDING_PAYMENT = "pendingPayment"
+    PAID = "paid"
+    READY_FOR_PICKUP = "readyForPickup"
     PICKED_UP = "pickedUp"
     CANCELLED = "cancelled"
     EXPIRED = "expired"
@@ -389,25 +398,74 @@ class OrderPublic(BaseModel):
     state: OrderState
     pickup_window: str
     items: List[OrderItemPublic]
+    # True once the order has reached 'pickedUp' — the "review unlocked"
+    # signal fired by the state machine (see app/order_events.py). No
+    # review-submission endpoint exists yet; this is what it'll gate on.
+    review_unlocked: bool
 
 
 class OrderStateUpdate(BaseModel):
     """Vendor-only transition on one of their shop's orders (see
     PATCH /shops/me/orders/{order_id}) — a customer cancels their own via
-    the dedicated POST /orders/{order_id}/cancel instead. Only these two
-    target states are ever valid to set by hand; 'booked' is the only
-    starting state and 'expired' is meant for a future automated job, not
-    a manual action."""
+    the dedicated POST /orders/{order_id}/cancel instead, and confirms
+    their own payment via POST /orders/{order_id}/pay. Only these three
+    target states are ever valid to set by hand here; 'pendingPayment' and
+    'paid' are reached elsewhere, and 'expired' is meant for a future
+    automated job, not a manual action. Whether the *current* state
+    actually allows the requested jump is enforced separately by the state
+    machine (app/order_state_machine.py), not here — this only checks
+    which states are settable by a vendor at all."""
 
     state: OrderState
 
     @field_validator("state")
     @classmethod
     def _check_settable(cls, v: OrderState) -> OrderState:
-        if v not in (OrderState.PICKED_UP, OrderState.CANCELLED):
-            raise ValueError("Stato non impostabile manualmente: solo 'pickedUp' o 'cancelled'.")
+        settable = (OrderState.READY_FOR_PICKUP, OrderState.PICKED_UP, OrderState.CANCELLED)
+        if v not in settable:
+            allowed = ", ".join(f"'{s.value}'" for s in settable)
+            raise ValueError(f"Stato non impostabile manualmente: solo {allowed}.")
         return v
 
 
 class ShopLicenseStatusUpdate(BaseModel):
     status: LicenseStatus
+
+
+# ---------------------------------------------------------------------------
+# Notifications (in-app history — table exists since the original schema
+# dump; app/order_events.py is the writer, see app/routers/notifications.py
+# for the reader) + push device tokens (Firebase Cloud Messaging, via
+# firebase-admin — see app/push_utils.py).
+# ---------------------------------------------------------------------------
+
+class NotificationType(str, Enum):
+    ORDER_CONFIRMED = "orderConfirmed"
+    PICKUP_REMINDER = "pickupReminder"
+    BOX_AVAILABLE = "boxAvailable"
+    REVIEW_REQUEST = "reviewRequest"
+    ALLERGEN_FLAGGED = "allergenFlagged"
+    OTHER = "other"
+
+
+class NotificationPublic(BaseModel):
+    id: str
+    type: NotificationType
+    text: str
+    is_read: bool
+    date: datetime
+
+
+class PushPlatform(str, Enum):
+    IOS = "ios"
+    ANDROID = "android"
+
+
+class PushTokenRequest(BaseModel):
+    """Registers (or re-registers, on the same token — e.g. after a
+    re-login) this device for push notifications. `token` is the *native*
+    FCM/APNs token from `Notifications.getDevicePushTokenAsync()` on the
+    client, not an Expo push token — see src/utils/pushNotifications.js."""
+
+    token: str = Field(min_length=1, max_length=255)
+    platform: PushPlatform

@@ -4,6 +4,7 @@ import { useEffect, useState } from 'react';
 import { ActivityIndicator, Alert, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { createBox, deleteBox, listMyBoxes, updateBox } from '../src/api/boxes';
+import { listNotifications } from '../src/api/notifications';
 import { listShopOrders, setShopOrderState } from '../src/api/orders';
 import { createShop, getMyShop, replaceLicense, updateMyShop } from '../src/api/shops';
 import BoxForm from '../src/components/BoxForm';
@@ -41,6 +42,14 @@ export default function HomeVenditore() {
   const [isLoadingOrders, setIsLoadingOrders] = useState(false);
   const [ordersError, setOrdersError] = useState(null);
   const [updatingOrderId, setUpdatingOrderId] = useState(null);
+
+  const [unreadCount, setUnreadCount] = useState(0);
+
+  useEffect(() => {
+    listNotifications()
+      .then((items) => setUnreadCount(items.filter((n) => !n.is_read).length))
+      .catch(() => {}); // non-fatal: the rest of the screen works without this
+  }, []);
 
   // The real DB schema ties license_url/verificationStatus to `store`, not
   // to `user` (see backend/db/projectwork_en_v2.sql) — so license status
@@ -175,6 +184,14 @@ export default function HomeVenditore() {
     ]);
   }
 
+  // pendingPayment -> paid avviene lato cliente (POST /orders/{id}/pay);
+  // da qui il vendor può solo far avanzare paid -> readyForPickup ->
+  // pickedUp, o annullare da uno qualunque dei tre stati non terminali —
+  // vedi backend/app/order_state_machine.py.
+  function handleMarkReady(order) {
+    handleOrderState(order, 'readyForPickup');
+  }
+
   return (
     <SafeAreaView style={styles.container} edges={['top', 'left', 'right']}>
       <ScrollView contentContainerStyle={styles.content}>
@@ -183,7 +200,14 @@ export default function HomeVenditore() {
             <Text style={styles.title}>Bentornato, {user?.username}! 🏪</Text>
             <Text style={styles.subtitle}>{user?.email}</Text>
           </View>
-          <PrimaryButton title="Esci" variant="outline" onPress={handleLogout} />
+          <View style={styles.headerActions}>
+            <PrimaryButton
+              title={unreadCount > 0 ? `Notifiche 🔔 (${unreadCount})` : 'Notifiche 🔔'}
+              variant="outline"
+              onPress={() => router.push('/notifications')}
+            />
+            <PrimaryButton title="Esci" variant="outline" onPress={handleLogout} style={styles.logoutButton} />
+          </View>
         </View>
 
         {licenseStatus ? (
@@ -242,6 +266,7 @@ export default function HomeVenditore() {
             isLoading={isLoadingOrders}
             error={ordersError}
             updatingOrderId={updatingOrderId}
+            onMarkReady={handleMarkReady}
             onMarkPickedUp={(order) => handleOrderState(order, 'pickedUp')}
             onCancel={handleCancelOrder}
           />
@@ -360,13 +385,19 @@ function BoxesSection({
 }
 
 const ORDER_STATE_LABEL = {
-  booked: 'Prenotato ⏳',
+  pendingPayment: 'In attesa di pagamento 💳',
+  paid: 'Pagato ✅',
+  readyForPickup: 'Pronto per il ritiro 📦',
   pickedUp: 'Ritirato ✅',
   cancelled: 'Annullato ❌',
   expired: 'Scaduto ⌛',
 };
 
-function OrdersSection({ orders, isLoading, error, updatingOrderId, onMarkPickedUp, onCancel }) {
+// Stati da cui il vendor può ancora annullare (mirror di
+// backend/app/order_state_machine.py).
+const CANCELLABLE_STATES = ['pendingPayment', 'paid', 'readyForPickup'];
+
+function OrdersSection({ orders, isLoading, error, updatingOrderId, onMarkReady, onMarkPickedUp, onCancel }) {
   return (
     <View style={styles.boxesSection}>
       <Text style={styles.sectionTitle}>Ordini ricevuti 🧾</Text>
@@ -391,7 +422,17 @@ function OrdersSection({ orders, isLoading, error, updatingOrderId, onMarkPicked
           <Text style={styles.boxMeta}>Ritiro {order.pickup_window}</Text>
           <Text style={styles.boxMeta}>Prenotato il {new Date(order.order_date).toLocaleString()}</Text>
           <Text style={styles.boxPrice}>€ {order.total_price.toFixed(2)}</Text>
-          {order.state === 'booked' ? (
+          {order.state === 'paid' ? (
+            <View style={styles.boxActions}>
+              <PrimaryButton
+                title="Segna pronto per il ritiro"
+                loading={updatingOrderId === order.id}
+                onPress={() => onMarkReady(order)}
+                style={styles.boxActionButton}
+              />
+            </View>
+          ) : null}
+          {order.state === 'readyForPickup' ? (
             <View style={styles.boxActions}>
               <PrimaryButton
                 title="Segna ritirato"
@@ -399,6 +440,10 @@ function OrdersSection({ orders, isLoading, error, updatingOrderId, onMarkPicked
                 onPress={() => onMarkPickedUp(order)}
                 style={styles.boxActionButton}
               />
+            </View>
+          ) : null}
+          {CANCELLABLE_STATES.includes(order.state) ? (
+            <View style={styles.boxActions}>
               <PrimaryButton
                 title="Annulla"
                 variant="outline"
@@ -420,6 +465,8 @@ const styles = StyleSheet.create({
   header: { flexDirection: 'row', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: spacing.md },
   title: { fontSize: 20, fontWeight: '800', color: colors.text },
   subtitle: { fontSize: 14, color: colors.textMuted, marginTop: spacing.xs },
+  headerActions: { alignItems: 'flex-end' },
+  logoutButton: { marginTop: spacing.sm },
   statusBadge: {
     alignSelf: 'flex-start',
     backgroundColor: colors.surface,

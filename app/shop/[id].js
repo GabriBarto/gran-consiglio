@@ -4,6 +4,7 @@ import { ActivityIndicator, Linking, ScrollView, StyleSheet, Text, View } from '
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { addCartItem, checkoutCart, getCart, removeCartItem, setCartItemQuantity } from '../../src/api/cart';
 import { listShopBoxes } from '../../src/api/boxes';
+import { payOrder } from '../../src/api/orders';
 import { getShop } from '../../src/api/shops';
 import { colors, radius, spacing } from '../../src/theme';
 import PrimaryButton from '../../src/components/PrimaryButton';
@@ -26,6 +27,8 @@ export default function ShopDetail() {
   const [isCheckingOut, setIsCheckingOut] = useState(false);
   const [checkoutError, setCheckoutError] = useState(null);
   const [bookedOrder, setBookedOrder] = useState(null);
+  const [isPaying, setIsPaying] = useState(false);
+  const [payError, setPayError] = useState(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -118,6 +121,22 @@ export default function ShopDetail() {
     }
   }
 
+  // Nessun gateway di pagamento reale è ancora collegato (vedi
+  // backend/README.md) — questo conferma il pagamento simulato
+  // (pendingPayment -> paid) tramite lo stesso endpoint che userà un vero
+  // provider in futuro.
+  async function handleConfirmPayment() {
+    setIsPaying(true);
+    setPayError(null);
+    try {
+      setBookedOrder(await payOrder(bookedOrder.id));
+    } catch (err) {
+      setPayError(err.message);
+    } finally {
+      setIsPaying(false);
+    }
+  }
+
   if (isLoading) {
     return (
       <View style={styles.center}>
@@ -159,6 +178,20 @@ export default function ShopDetail() {
             <Text style={styles.confirmationBody}>
               Ritira tra le {bookedOrder.pickup_window.replace('-', ' e le ')} — totale € {bookedOrder.total_price.toFixed(2)}.
             </Text>
+            {bookedOrder.state === 'pendingPayment' ? (
+              <>
+                <Text style={styles.confirmationBody}>In attesa di pagamento.</Text>
+                {payError ? <Text style={styles.errorText}>{payError}</Text> : null}
+                <PrimaryButton
+                  title="Conferma pagamento"
+                  loading={isPaying}
+                  onPress={handleConfirmPayment}
+                  style={styles.confirmationButton}
+                />
+              </>
+            ) : (
+              <Text style={styles.confirmationBody}>Pagamento confermato ✅</Text>
+            )}
             <PrimaryButton
               title="Vai a I miei ordini"
               variant="outline"

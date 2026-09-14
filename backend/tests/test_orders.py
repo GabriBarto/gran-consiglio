@@ -17,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
+from app.db.engine import get_session
+from app.db.models import NotificationRow
 from app.main import app
 
 client = TestClient(app).__enter__()
@@ -157,7 +159,8 @@ def test_checkout_creates_order_and_updates_availability():
     checkout = client.post(f"/shops/{shop_id}/cart/checkout", headers=_auth_headers(customer_token))
     assert checkout.status_code == 201, checkout.text
     order = checkout.json()
-    assert order["state"] == "booked"
+    assert order["state"] == "pendingPayment"
+    assert order["review_unlocked"] is False
     assert order["total_price"] == round(4.99 * 2, 2)
     assert order["items"][0]["quantity"] == 2
     assert order["pickup_window"] == "18:00-19:00"
@@ -218,10 +221,97 @@ def test_checkout_emptied_cart_rejected():
 
 
 # ---------------------------------------------------------------------------
-# Cancellation / pickup
+# State machine: pending_payment -> paid -> ready_for_pickup -> picked_up,
+# cancellation from any non-terminal state, and rejection of invalid jumps
+# — see app/order_state_machine.py.
 # ---------------------------------------------------------------------------
 
-def test_customer_can_cancel_booked_order_and_stock_is_restored():
+def test_order_lifecycle_pay_ready_pickup_and_triggers():
+    vendor_token, shop_id, box_id = _new_approved_vendor_with_box("vendor.order5@example.com", "Vendor Order Five")
+    customer_token = _new_customer("customer.order5@example.com", "Customer Order Five")
+
+    client.post(
+        f"/shops/{shop_id}/cart/items", json={"box_id": box_id, "quantity": 1}, headers=_auth_headers(customer_token)
+    )
+    order = client.post(f"/shops/{shop_id}/cart/checkout", headers=_auth_headers(customer_token)).json()
+    assert order["state"] == "pendingPayment"
+
+    listed = client.get("/shops/me/orders", headers=_auth_headers(vendor_token))
+    assert listed.status_code == 200
+    assert len(listed.json()) == 1
+
+    paid = client.post(f"/orders/{order['id']}/pay", headers=_auth_headers(customer_token))
+    assert paid.status_code == 200, paid.text
+    assert paid.json()["state"] == "paid"
+
+    ready = client.patch(
+        f"/shops/me/orders/{order['id']}", json={"state": "readyForPickup"}, headers=_auth_headers(vendor_token)
+    )
+    assert ready.status_code == 200, ready.text
+    assert ready.json()["state"] == "readyForPickup"
+    assert ready.json()["review_unlocked"] is False
+
+    picked_up = client.patch(
+        f"/shops/me/orders/{order['id']}", json={"state": "pickedUp"}, headers=_auth_headers(vendor_token)
+    )
+    assert picked_up.status_code == 200, picked_up.text
+    assert picked_up.json()["state"] == "pickedUp"
+    # The "review unlock" trigger (app/order_events.py) fires on this transition.
+    assert picked_up.json()["review_unlocked"] is True
+
+    # Each transition (paid/readyForPickup/pickedUp) fired the notification
+    # trigger too — one persisted `notification` row per state change.
+    customer_id = int(client.get("/users/me", headers=_auth_headers(customer_token)).json()["id"])
+    with get_session() as session:
+        notif_types = {
+            n.type for n in session.query(NotificationRow).filter(NotificationRow.user_id == customer_id).all()
+        }
+    assert {"orderConfirmed", "pickupReminder", "reviewRequest"} <= notif_types
+
+
+def test_order_state_transitions_cannot_skip_steps():
+    vendor_token, shop_id, box_id = _new_approved_vendor_with_box("vendor.order5b@example.com", "Vendor Order Five B")
+    customer_token = _new_customer("customer.order5b@example.com", "Customer Order Five B")
+    client.post(
+        f"/shops/{shop_id}/cart/items", json={"box_id": box_id, "quantity": 1}, headers=_auth_headers(customer_token)
+    )
+    order = client.post(f"/shops/{shop_id}/cart/checkout", headers=_auth_headers(customer_token)).json()
+
+    # Still 'pendingPayment' — jumping straight to 'pickedUp' (skipping
+    # 'paid' and 'readyForPickup') is a valid *settable* state but not a
+    # valid transition from here: rejected by the state machine, not by
+    # request validation.
+    skip = client.patch(
+        f"/shops/me/orders/{order['id']}", json={"state": "pickedUp"}, headers=_auth_headers(vendor_token)
+    )
+    assert skip.status_code == 409, skip.text
+
+    # Marking ready for pickup before payment is confirmed is the same
+    # kind of invalid jump.
+    early_ready = client.patch(
+        f"/shops/me/orders/{order['id']}", json={"state": "readyForPickup"}, headers=_auth_headers(vendor_token)
+    )
+    assert early_ready.status_code == 409, early_ready.text
+
+
+def test_order_state_update_rejects_non_settable_state():
+    vendor_token, shop_id, box_id = _new_approved_vendor_with_box("vendor.order6@example.com", "Vendor Order Six")
+    customer_token = _new_customer("customer.order6@example.com", "Customer Order Six")
+    client.post(
+        f"/shops/{shop_id}/cart/items", json={"box_id": box_id, "quantity": 1}, headers=_auth_headers(customer_token)
+    )
+    order = client.post(f"/shops/{shop_id}/cart/checkout", headers=_auth_headers(customer_token)).json()
+
+    # 'paid' is a real state but only reachable via POST /orders/{id}/pay,
+    # never settable by the vendor directly — rejected at the request
+    # validation layer (422), before the state machine even runs.
+    bad = client.patch(
+        f"/shops/me/orders/{order['id']}", json={"state": "paid"}, headers=_auth_headers(vendor_token)
+    )
+    assert bad.status_code == 422
+
+
+def test_customer_can_cancel_from_any_non_terminal_state_and_stock_is_restored():
     _, shop_id, box_id = _new_approved_vendor_with_box("vendor.order4@example.com", "Vendor Order Four", max_boxes=5)
     customer_token = _new_customer("customer.order4@example.com", "Customer Order Four")
 
@@ -230,6 +320,7 @@ def test_customer_can_cancel_booked_order_and_stock_is_restored():
     )
     order = client.post(f"/shops/{shop_id}/cart/checkout", headers=_auth_headers(customer_token)).json()
 
+    # Cancellable while still pendingPayment (before any payment step).
     cancel = client.post(f"/orders/{order['id']}/cancel", headers=_auth_headers(customer_token))
     assert cancel.status_code == 200, cancel.text
     assert cancel.json()["state"] == "cancelled"
@@ -237,43 +328,42 @@ def test_customer_can_cancel_booked_order_and_stock_is_restored():
     box_after = client.get(f"/shops/{shop_id}/boxes", headers=_auth_headers(customer_token)).json()
     assert box_after[0]["available"] == 5  # restocked
 
-    # Cancelling twice is rejected — no longer 'booked'.
+    # Cancelling twice is rejected — 'cancelled' is terminal.
     second_cancel = client.post(f"/orders/{order['id']}/cancel", headers=_auth_headers(customer_token))
     assert second_cancel.status_code == 409
 
 
-def test_vendor_can_mark_order_picked_up():
-    vendor_token, shop_id, box_id = _new_approved_vendor_with_box("vendor.order5@example.com", "Vendor Order Five")
-    customer_token = _new_customer("customer.order5@example.com", "Customer Order Five")
+def test_customer_can_cancel_after_paying():
+    _, shop_id, box_id = _new_approved_vendor_with_box("vendor.order4b@example.com", "Vendor Order Four B", max_boxes=5)
+    customer_token = _new_customer("customer.order4b@example.com", "Customer Order Four B")
 
     client.post(
         f"/shops/{shop_id}/cart/items", json={"box_id": box_id, "quantity": 1}, headers=_auth_headers(customer_token)
     )
     order = client.post(f"/shops/{shop_id}/cart/checkout", headers=_auth_headers(customer_token)).json()
+    client.post(f"/orders/{order['id']}/pay", headers=_auth_headers(customer_token))
 
-    listed = client.get("/shops/me/orders", headers=_auth_headers(vendor_token))
-    assert listed.status_code == 200
-    assert len(listed.json()) == 1
+    cancel = client.post(f"/orders/{order['id']}/cancel", headers=_auth_headers(customer_token))
+    assert cancel.status_code == 200, cancel.text
+    assert cancel.json()["state"] == "cancelled"
 
-    picked_up = client.patch(
-        f"/shops/me/orders/{order['id']}", json={"state": "pickedUp"}, headers=_auth_headers(vendor_token)
-    )
-    assert picked_up.status_code == 200, picked_up.text
-    assert picked_up.json()["state"] == "pickedUp"
+    box_after = client.get(f"/shops/{shop_id}/boxes", headers=_auth_headers(customer_token)).json()
+    assert box_after[0]["available"] == 5  # restocked even once paid
 
 
-def test_order_state_update_rejects_invalid_target_state():
-    vendor_token, shop_id, box_id = _new_approved_vendor_with_box("vendor.order6@example.com", "Vendor Order Six")
-    customer_token = _new_customer("customer.order6@example.com", "Customer Order Six")
+def test_pay_order_rejected_once_already_paid():
+    _, shop_id, box_id = _new_approved_vendor_with_box("vendor.order4c@example.com", "Vendor Order Four C")
+    customer_token = _new_customer("customer.order4c@example.com", "Customer Order Four C")
     client.post(
         f"/shops/{shop_id}/cart/items", json={"box_id": box_id, "quantity": 1}, headers=_auth_headers(customer_token)
     )
     order = client.post(f"/shops/{shop_id}/cart/checkout", headers=_auth_headers(customer_token)).json()
 
-    bad = client.patch(
-        f"/shops/me/orders/{order['id']}", json={"state": "booked"}, headers=_auth_headers(vendor_token)
-    )
-    assert bad.status_code == 422
+    first = client.post(f"/orders/{order['id']}/pay", headers=_auth_headers(customer_token))
+    assert first.status_code == 200, first.text
+
+    second = client.post(f"/orders/{order['id']}/pay", headers=_auth_headers(customer_token))
+    assert second.status_code == 409
 
 
 # ---------------------------------------------------------------------------

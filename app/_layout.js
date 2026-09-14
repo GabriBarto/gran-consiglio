@@ -25,6 +25,7 @@ export default function RootLayout() {
           <Stack.Screen name="admin" options={{ headerShown: false }} />
           <Stack.Screen name="shop/[id]" options={{ title: 'Negozio' }} />
           <Stack.Screen name="orders" options={{ title: 'I miei ordini' }} />
+          <Stack.Screen name="notifications" options={{ title: 'Notifiche' }} />
         </Stack>
         <StatusBar style="auto" />
       </AuthProvider>

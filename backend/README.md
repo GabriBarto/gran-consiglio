@@ -74,14 +74,92 @@ somma letterale delle singole fasce.
 | Requisito | Dove |
 |---|---|
 | Storico prenotazioni del cliente | `GET /orders`, `GET /orders/{order_id}` (proprietario, il vendor del negozio, o un admin) — [app/routers/orders.py](app/routers/orders.py) |
-| Il cliente annulla una prenotazione | `POST /orders/{order_id}/cancel` — solo se ancora `booked`; **ripristina** la quantità sulle box coinvolte (`sold_boxes -= quantity`) |
-| Il vendor gestisce le prenotazioni del proprio negozio | `GET /shops/me/orders`, `PATCH /shops/me/orders/{order_id}` (`{"state": "pickedUp"}` a ritiro avvenuto, o `{"state": "cancelled"}` per un cliente che non si è presentato — anche questo ripristina la disponibilità) |
+| Il cliente conferma il pagamento | `POST /orders/{order_id}/pay` — `pendingPayment` → `paid`. Non c'è ancora un vero gateway di pagamento integrato: questo endpoint fa da stand-in (va sempre a buon fine se chiamato nello stato giusto) fino a quando non se ne collega uno reale, senza che il resto del flusso cambi |
+| Il cliente annulla una prenotazione | `POST /orders/{order_id}/cancel` — da qualunque stato non terminale (`pendingPayment`/`paid`/`readyForPickup`); **ripristina** la quantità sulle box coinvolte (`sold_boxes -= quantity`) |
+| Il vendor gestisce le prenotazioni del proprio negozio | `GET /shops/me/orders`, `PATCH /shops/me/orders/{order_id}` (`{"state": "readyForPickup"}` a box pronta, `{"state": "pickedUp"}` a ritiro avvenuto, o `{"state": "cancelled"}` per un cliente che non si è presentato — anche questo ripristina la disponibilità) |
 
-Stati possibili (`orders.state`, invariati rispetto allo schema):
-`booked` → `pickedUp` **oppure** `cancelled`. `expired` esiste nello schema
-per una futura pulizia automatica delle prenotazioni scadute mai ritirate
+### Macchina a stati dell'ordine
+
+```
+pendingPayment ──pay()──▶ paid ──mark_ready()──▶ readyForPickup ──mark_picked_up()──▶ pickedUp
+      │                    │                            │
+      └──────────────┴─────cancel()/expire()────────────┘
+                       (da uno qualunque dei tre) ──▶ cancelled / expired
+```
+
+Tutta la logica vive in [app/order_state_machine.py](app/order_state_machine.py)
+(il grafo delle transizioni valide — niente salti di stato, es. da
+`pendingPayment` direttamente a `pickedUp`) e
+[app/order_events.py](app/order_events.py) (gli effetti collaterali di ogni
+transizione). `Repository._transition_order` in
+[app/database.py](app/database.py) è l'unico punto che scrive
+`orders.state`: valida la transizione, ripristina lo stock se l'ordine
+esce dal ciclo senza essere ritirato, scrive il nuovo stato e lancia gli
+eventi — tutto nella stessa transazione. Una transizione non valida
+(salto di stato, o una mossa da uno stato terminale) alza
+`InvalidOrderTransition`, mappato a 409 dai router.
+
+`pickedUp`, `cancelled` ed `expired` sono terminali. `expired` esiste per
+una futura pulizia automatica delle prenotazioni scadute mai ritirate
 (nessun job/cron in questo scope, stessa nota del punto 3 sulla scadenza
-delle box) — non è mai impostato a mano.
+delle box — vedi `Repository.expire_order`) — non è mai impostato a mano,
+nessun router lo espone.
+
+Ogni transizione (tranne l'ingresso in `pendingPayment`, il punto di
+partenza) lancia due tipi di trigger:
+- **notifica**: una riga in `notification` più una push (Firebase Cloud
+  Messaging) e un'email, entrambe best-effort — vedi punto 6 sotto
+  ([app/order_events.py](app/order_events.py)) — un fallimento qui non fa
+  mai fallire/annullare la transizione stessa;
+- **sblocco recensione**: arrivare a `pickedUp` marca `review_unlocked:
+  true` su `OrderPublic` e genera una notifica di tipo `reviewRequest` —
+  il segnale che la recensione è ora valida da lasciare. Scriverla non è
+  ancora implementato (nessun endpoint usa `ReviewRow` in scrittura), è il
+  prossimo pezzo che si aggancerà a questo trigger.
+
+## 6. Notifiche
+
+| Requisito | Dove |
+|---|---|
+| Storico notifiche in-app (tipo, testo, letta/non letta, data) | `GET /notifications`, `POST /notifications/{id}/read`, `POST /notifications/read-all` — [app/routers/notifications.py](app/routers/notifications.py). Tabella `notification`, già presente nello schema/seed originale ma scritta da nessun endpoint finché non è arrivata la macchina a stati degli ordini (punto 5) |
+| Push (Firebase Cloud Messaging) | `POST/DELETE /users/me/push-tokens` registra/rimuove il token nativo FCM/APNs del dispositivo corrente (tabella `push_token`, aggiunta in questa pass — vedi `-- ADDED` in [db/projectwork_en_v2.sql](db/projectwork_en_v2.sql)); l'invio vero e proprio è in [app/push_utils.py](app/push_utils.py), via `firebase-admin` |
+| Trigger: nuovo ordine → notifica al venditore | Al checkout ([app/order_events.py](app/order_events.py)::`fire_new_order_event`, chiamato da `Repository.checkout_cart`) |
+| Trigger: ordine pronto/promemoria ritiro → notifica al cliente | Transizione `paid` → `readyForPickup` (già parte della macchina a stati, punto 5 — tipo `pickupReminder`) |
+
+Ogni trigger di notifica (`app/order_events.py::_notify_user`) fa sempre le
+stesse tre cose, ognuna best-effort e indipendente dalle altre: scrive una
+riga in `notification`, invia una push a ogni dispositivo registrato
+dell'utente, invia un'email. Un fallimento su una gamba (token push
+scaduto, SMTP giù, Firebase non configurato) non blocca le altre né la
+transizione che l'ha scatenato.
+
+**Firebase — mock di default, stesso pattern dell'email**: senza
+`FIREBASE_CREDENTIALS_FILE` configurato, le push vengono solo loggate in
+console ([app/push_utils.py](app/push_utils.py)), mai spedite davvero —
+l'API resta comunque completamente testabile end-to-end. Per attivarle
+davvero: scarica una chiave di service account dalla console Firebase
+(Project settings → Service accounts → Generate new private key) e
+imposta `FIREBASE_CREDENTIALS_FILE=/percorso/alla/chiave.json` in `.env`.
+
+Questo copre solo l'invio *verso* Firebase — far arrivare la push su un
+telefono richiede anche, lato Expo (progetto root, non `backend/`): un
+vero progetto Firebase con un'app Android/iOS registrata, il
+`google-services.json` di quel progetto agganciato in `app.json`, e una
+**development build** (non Expo Go: dalla SDK 53 Expo Go non supporta più
+le push remote su Android — vedi
+[src/utils/pushNotifications.js](../src/utils/pushNotifications.js)).
+
+**Non incluso in questa pass — task periodico per "box in scadenza vicino
+a te"**: richiederebbe un job schedulato (Celery beat, come indicato nella
+richiesta) che gira periodicamente, cerca box in scadenza vicino agli
+utenti (riusando l'Haversine già in [app/geo.py](app/geo.py)) e genera la
+notifica di tipo `boxAvailable`/`allergenFlagged`. Non implementato perché
+introdurrebbe una dipendenza nuova per tutto il progetto (un broker Redis
++ un secondo processo worker/beat da tenere avviato in locale) — stessa
+scelta già fatta per la pulizia automatica degli ordini scaduti (punto 5)
+e delle box scadute (punto 3): nessun cron in questo scope, ma
+`Repository.expire_order` e questo stesso modulo (`app/order_events.py`)
+sono già pronti per essere chiamati da un job del genere quando arriva.
 
 ## Setup
 
@@ -247,9 +325,13 @@ sotto): un carrello attivo è per definizione uno stato transitorio, non ha
 senso seedarlo.
 
 `review`, `notification` hanno anch'esse 2 righe di dati di prova coerenti
-(FK rispettate), ma **nessun endpoint le usa ancora** — fanno parte dello
-schema/seed in preparazione di prossimi punti del progetto, non dei punti
-1-5 già implementati.
+(FK rispettate). `notification` è ora scritta dalla macchina a stati degli
+ordini (punto 5, un trigger per transizione — vedi
+[app/order_events.py](app/order_events.py)), ma non ha ancora un endpoint
+di lettura (`GET /notifications`). `review` resta **non scritta da nessun
+endpoint**: lo stato `pickedUp` la "sblocca" concettualmente
+(`OrderPublic.review_unlocked`), ma il submit vero e proprio è un pezzo
+futuro.
 
 `refresh_token`, `email_verification`, `password_reset` (bookkeeping auth
 effimero, vedi "Note per la produzione" sotto) partono invece sempre vuote:

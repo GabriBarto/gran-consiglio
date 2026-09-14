@@ -1,16 +1,22 @@
 import { useEffect, useState } from 'react';
 import { ActivityIndicator, FlatList, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { cancelMyOrder, listMyOrders } from '../src/api/orders';
+import { cancelMyOrder, listMyOrders, payOrder } from '../src/api/orders';
 import PrimaryButton from '../src/components/PrimaryButton';
 import { colors, radius, spacing } from '../src/theme';
 
 const STATE_LABEL = {
-  booked: 'Prenotato ⏳',
+  pendingPayment: 'In attesa di pagamento 💳',
+  paid: 'Pagato ✅',
+  readyForPickup: 'Pronto per il ritiro 📦',
   pickedUp: 'Ritirato ✅',
   cancelled: 'Annullato ❌',
   expired: 'Scaduto ⌛',
 };
+
+// States from which the customer can still cancel (mirrors the backend's
+// order state machine — backend/app/order_state_machine.py).
+const CANCELLABLE_STATES = ['pendingPayment', 'paid', 'readyForPickup'];
 
 // Customer's own booking history (backend/app/routers/orders.py) — reached
 // from the "Prenota e ritira" confirmation on a shop's page, or directly.
@@ -19,6 +25,7 @@ export default function MyOrders() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
   const [cancellingId, setCancellingId] = useState(null);
+  const [payingId, setPayingId] = useState(null);
 
   useEffect(() => {
     load();
@@ -45,6 +52,18 @@ export default function MyOrders() {
       setError(err.message);
     } finally {
       setCancellingId(null);
+    }
+  }
+
+  async function handlePay(order) {
+    setPayingId(order.id);
+    try {
+      await payOrder(order.id);
+      await load();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setPayingId(null);
     }
   }
 
@@ -77,7 +96,15 @@ export default function MyOrders() {
             <Text style={styles.meta}>Ritiro {item.pickup_window}</Text>
             <Text style={styles.meta}>Prenotato il {new Date(item.order_date).toLocaleString()}</Text>
             <Text style={styles.total}>Totale € {item.total_price.toFixed(2)}</Text>
-            {item.state === 'booked' ? (
+            {item.state === 'pendingPayment' ? (
+              <PrimaryButton
+                title="Conferma pagamento"
+                loading={payingId === item.id}
+                onPress={() => handlePay(item)}
+                style={styles.cancelButton}
+              />
+            ) : null}
+            {CANCELLABLE_STATES.includes(item.state) ? (
               <PrimaryButton
                 title="Annulla prenotazione"
                 variant="outline"

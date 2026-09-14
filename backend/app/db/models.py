@@ -4,9 +4,12 @@ backend/db/projectwork_en_v2.sql: `user`, `store`, `box`, `cart`/`cart_item`
 and `orders`/`order_item` (the tables the app's core features read/write),
 `refresh_token`/`email_verification`/`password_reset` (short-lived auth
 bookkeeping, persisted here instead of in-process memory so it survives an
-API restart — see app/database.py), and `review`/`notification`, which
-exist in the schema+seed data for future features but have no endpoints
-yet.
+API restart — see app/database.py), and `review`/`notification`: they
+existed in the schema+seed data for future features with no endpoints
+using them yet — the order state machine (app/order_events.py) is now the
+first writer of `notification` (one row per order state change) and the
+first *reader* of `review`'s shape (no write endpoint yet — see
+ReviewRow's docstring).
 
 Python attribute names favor readability (e.g. `vendor_id`, `license_url`)
 while `mapped_column("dbColumnName", ...)` keeps them wired to the schema's
@@ -134,8 +137,12 @@ class OrderRow(Base):
     shop_id: Mapped[int] = mapped_column("storeId", ForeignKey("store.id"))
     total_price: Mapped[float] = mapped_column("totalPrice", Float)
     order_date: Mapped[datetime] = mapped_column("orderDate", TIMESTAMP, server_default=func.current_timestamp())
+    # Full lifecycle — see app/order_state_machine.py for the valid
+    # transitions between these and app/order_events.py for what each one
+    # triggers (notification, review unlock, ...).
     state: Mapped[str] = mapped_column(
-        Enum("booked", "pickedUp", "cancelled", "expired", name="order_state"), default="booked"
+        Enum("pendingPayment", "paid", "readyForPickup", "pickedUp", "cancelled", "expired", name="order_state"),
+        default="pendingPayment",
     )
     # A single "HH:MM-HH:MM" range, not per-item — see
     # Repository.checkout_cart for how it's derived when a cart mixes boxes
@@ -158,6 +165,72 @@ class OrderItemRow(Base):
     unit_price: Mapped[float] = mapped_column("unitPrice", Float)
 
     order: Mapped["OrderRow"] = relationship(back_populates="items")
+
+
+class ReviewRow(Base):
+    """A customer's review of one of their own (picked-up) orders — table
+    existed in the schema+seed data before any endpoint used it (see
+    backend/README.md); the order state machine (app/order_events.py) is
+    the first thing to reference it, marking the moment (state ==
+    'pickedUp') a review becomes valid to leave. Writing one is a future
+    piece of work (no router yet), this mapping is what it'll build on."""
+
+    __tablename__ = "review"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column("orderId", ForeignKey("orders.id", ondelete="CASCADE"))
+    user_id: Mapped[int] = mapped_column("userId", ForeignKey("user.id", ondelete="CASCADE"))
+    shop_id: Mapped[int] = mapped_column("storeId", ForeignKey("store.id", ondelete="CASCADE"))
+    rating: Mapped[float] = mapped_column(Float)
+    text: Mapped[str] = mapped_column(String(500))
+    date: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=func.current_timestamp())
+
+
+class NotificationRow(Base):
+    """One in-app notification for a user — table existed in the schema+
+    seed data before any endpoint used it (see backend/README.md). The
+    order state machine (app/order_events.py) is the first writer: one row
+    per order state change, alongside a best-effort email
+    (app/email_utils.py). Reading/marking-read is a future piece of work
+    (no GET /notifications endpoint yet)."""
+
+    __tablename__ = "notification"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column("userId", ForeignKey("user.id", ondelete="CASCADE"))
+    type: Mapped[str] = mapped_column(
+        Enum(
+            "orderConfirmed",
+            "pickupReminder",
+            "boxAvailable",
+            "reviewRequest",
+            "allergenFlagged",
+            "other",
+            name="notification_type",
+        )
+    )
+    text: Mapped[str] = mapped_column(String(100))
+    is_read: Mapped[bool] = mapped_column("isRead", Boolean, default=False)
+    date: Mapped[datetime] = mapped_column(TIMESTAMP, server_default=func.current_timestamp())
+
+
+class PushTokenRow(Base):
+    """A device registered for push notifications (Firebase Cloud
+    Messaging — see app/push_utils.py). `token` is the device's *native*
+    FCM/APNs token (Notifications.getDevicePushTokenAsync() on the
+    client), unique across all users: re-registering the same token (a
+    re-login on the same device) just moves it to the current user rather
+    than erroring, and logging out unregisters it (see
+    routers/notifications.py) so a shared/reset device stops getting
+    another account's pushes."""
+
+    __tablename__ = "push_token"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column("userId", ForeignKey("user.id", ondelete="CASCADE"))
+    token: Mapped[str] = mapped_column(String(255), unique=True)
+    platform: Mapped[str] = mapped_column(Enum("ios", "android", name="push_platform"))
+    created_at: Mapped[datetime] = mapped_column("createdAt", TIMESTAMP, server_default=func.current_timestamp())
 
 
 class RefreshTokenRow(Base):

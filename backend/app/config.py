@@ -68,5 +68,14 @@ class Settings(BaseSettings):
     # Used to build the links embedded in verification / reset emails.
     frontend_base_url: str = "http://localhost:8081"
 
+    # Push notifications (Firebase Cloud Messaging, via firebase-admin —
+    # see app/push_utils.py). Optional, same pattern as SMTP above: leave
+    # unset to use the console "mock" push backend (logs instead of
+    # sending), handy for local dev without a real Firebase project. Set
+    # to the path of a service account JSON downloaded from the Firebase
+    # console (Project settings -> Service accounts -> Generate new
+    # private key) to send real pushes.
+    firebase_credentials_file: Optional[str] = None
+
 
 settings = Settings()
