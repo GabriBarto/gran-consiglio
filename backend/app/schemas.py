@@ -242,5 +242,172 @@ class ShopSearchResponse(BaseModel):
     items: List[ShopPublic]
 
 
+class BoxRequest(BaseModel):
+    """Shared shape for creating and (fully) updating one of the vendor's
+    boxes. `sold_boxes` structurally has no field here at all — it's only
+    ever moved by a future order/checkout flow, never set directly by the
+    vendor (same reasoning as license_status not being on ShopRequest)."""
+
+    name: str
+    price: float = Field(..., gt=0)
+    description: str
+    category: str
+    allergens: str
+    max_boxes: int = Field(..., gt=0, description="Quante box di questo tipo sono disponibili in totale")
+    pickup_window_start: str = Field(..., description="Formato HH:MM (24h)")
+    pickup_window_end: str = Field(..., description="Formato HH:MM (24h)")
+    expire_at: datetime = Field(..., description="Entro quando la box va ritirata, dopo scompare dal catalogo")
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, v: str) -> str:
+        trimmed = v.strip()
+        if not (2 <= len(trimmed) <= 50):  # varchar(50) in the DB
+            raise ValueError("Il nome della box deve avere tra 2 e 50 caratteri.")
+        return trimmed
+
+    @field_validator("description")
+    @classmethod
+    def _check_description(cls, v: str) -> str:
+        trimmed = v.strip()
+        if not trimmed or len(trimmed) > 250:  # varchar(250) in the DB
+            raise ValueError("La descrizione è obbligatoria e non può superare 250 caratteri.")
+        return trimmed
+
+    @field_validator("category")
+    @classmethod
+    def _check_category(cls, v: str) -> str:
+        trimmed = v.strip()
+        if not trimmed or len(trimmed) > 100:  # varchar(100) in the DB
+            raise ValueError("La categoria è obbligatoria e non può superare 100 caratteri.")
+        return trimmed
+
+    @field_validator("allergens")
+    @classmethod
+    def _check_allergens(cls, v: str) -> str:
+        trimmed = v.strip()
+        if not trimmed or len(trimmed) > 250:  # varchar(250) in the DB
+            raise ValueError("Indica gli allergeni (anche 'Nessuno') — massimo 250 caratteri.")
+        return trimmed
+
+    @field_validator("pickup_window_start", "pickup_window_end")
+    @classmethod
+    def _check_time_format(cls, v: str) -> str:
+        return _validate_hhmm(v)
+
+    @model_validator(mode="after")
+    def _check_pickup_window_order(self) -> "BoxRequest":
+        if self.pickup_window_start >= self.pickup_window_end:
+            raise ValueError("La fascia di ritiro deve avere un orario di inizio precedente a quello di fine.")
+        return self
+
+
+class BoxPublic(BaseModel):
+    id: str
+    shop_id: str
+    name: str
+    price: float
+    description: str
+    category: str
+    allergens: str
+    max_boxes: int
+    sold_boxes: int
+    available: int = Field(..., description="max_boxes - sold_boxes, mai negativo")
+    pickup_window_start: str
+    pickup_window_end: str
+    expire_at: datetime
+    created_at: datetime
+
+
+class AdminShopPublic(ShopPublic):
+    """ShopPublic plus the vendor's own account info — only exposed to
+    admins reviewing the license queue (GET /admin/shops), where knowing
+    *who* owns the shop is the whole point (the vendor's own create/update
+    requests never see or set this)."""
+
+    vendor_username: str
+    vendor_email: str
+
+
+# ---------------------------------------------------------------------------
+# Cart + checkout (customer side of the box flow — see routers/cart.py)
+# ---------------------------------------------------------------------------
+
+class CartItemRequest(BaseModel):
+    box_id: str
+    quantity: int = Field(..., gt=0)
+
+
+class CartItemQuantityUpdate(BaseModel):
+    quantity: int = Field(..., gt=0)
+
+
+class CartItemPublic(BaseModel):
+    box_id: str
+    box_name: str
+    unit_price: float
+    quantity: int
+    subtotal: float
+    # The box's *current* availability (independent of how many of it are
+    # already sitting in this cart) — lets the client warn "solo 2 rimaste"
+    # before checkout ever rejects it.
+    available: int
+
+
+class CartPublic(BaseModel):
+    shop_id: str
+    shop_name: str
+    items: List[CartItemPublic]
+    total_price: float
+
+
+# ---------------------------------------------------------------------------
+# Orders (created from a cart at checkout — see Repository.checkout_cart)
+# ---------------------------------------------------------------------------
+
+class OrderState(str, Enum):
+    BOOKED = "booked"
+    PICKED_UP = "pickedUp"
+    CANCELLED = "cancelled"
+    EXPIRED = "expired"
+
+
+class OrderItemPublic(BaseModel):
+    box_id: str
+    box_name: str
+    quantity: int
+    unit_price: float
+    subtotal: float
+
+
+class OrderPublic(BaseModel):
+    id: str
+    shop_id: str
+    shop_name: str
+    total_price: float
+    order_date: datetime
+    state: OrderState
+    pickup_window: str
+    items: List[OrderItemPublic]
+
+
+class OrderStateUpdate(BaseModel):
+    """Vendor-only transition on one of their shop's orders (see
+    PATCH /shops/me/orders/{order_id}) — a customer cancels their own via
+    the dedicated POST /orders/{order_id}/cancel instead. Only these two
+    target states are ever valid to set by hand; 'booked' is the only
+    starting state and 'expired' is meant for a future automated job, not
+    a manual action."""
+
+    state: OrderState
+
+    @field_validator("state")
+    @classmethod
+    def _check_settable(cls, v: OrderState) -> OrderState:
+        if v not in (OrderState.PICKED_UP, OrderState.CANCELLED):
+            raise ValueError("Stato non impostabile manualmente: solo 'pickedUp' o 'cancelled'.")
+        return v
+
+
 class ShopLicenseStatusUpdate(BaseModel):
     status: LicenseStatus

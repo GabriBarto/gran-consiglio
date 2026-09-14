@@ -1,13 +1,15 @@
 """
-Fake object-storage layer standing in for S3 / Google Cloud Storage.
+File storage layer for vendor license uploads.
 
 License documents must never live in the relational database — only a
-reference (URL + metadata) to the stored object does. Until a real bucket is
-available, files are written to disk under FAKE_STORAGE_DIR and served
-through a fake URL. Replace save_license_file()'s body with e.g. a boto3
-upload_fileobj() (S3) or google-cloud-storage Blob.upload_from_file() (GCS)
-call when a real bucket exists — callers (routers/*.py) only depend on the
-StoredFile shape returned here, so nothing else needs to change.
+reference (URL + metadata) to the stored object does. Files are written to
+disk under LICENSE_STORAGE_DIR and actually served by this same API (see
+the StaticFiles mount in main.py) at a real, working URL — self-hosted
+rather than a cloud bucket, but not a mock: every URL returned here really
+downloads the uploaded file. Swap save_license_file()'s body for e.g. a
+boto3 upload_fileobj() (S3) or google-cloud-storage Blob.upload_from_file()
+(GCS) call when a real bucket is available — callers (routers/*.py) only
+depend on the StoredFile shape returned here, so nothing else would change.
 """
 from __future__ import annotations
 
@@ -23,13 +25,17 @@ ALLOWED_CONTENT_TYPES = {"application/pdf", "image/jpeg", "image/png"}
 # backend/ (this file's grandparent: backend/app/storage.py -> backend/).
 _BACKEND_DIR = Path(__file__).resolve().parent.parent
 
-_configured_dir = Path(settings.fake_storage_dir)
+_configured_dir = Path(settings.license_storage_dir)
 # Anchor a relative path to backend/ rather than to the process's cwd, so
 # the upload location is the same whether uvicorn is launched from the
-# repo root or from inside backend/ (see the comment on fake_storage_dir
+# repo root or from inside backend/ (see the comment on license_storage_dir
 # in config.py — this is what fixes the backend/backend/uploads nesting).
 UPLOAD_DIR = _configured_dir if _configured_dir.is_absolute() else _BACKEND_DIR / _configured_dir
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Public URL prefix this directory is mounted under — see the StaticFiles
+# mount in main.py, which must use this same path.
+UPLOAD_URL_PATH = "/uploads/licenses"
 
 
 class UploadRejected(Exception):
@@ -60,8 +66,11 @@ def save_license_file(*, user_id: str, filename: Optional[str], content_type: Op
     dest = UPLOAD_DIR / stored_name
     dest.write_bytes(data)
 
-    # In production this would be whatever URL the SDK hands back, e.g.:
+    # Really downloadable: this API serves UPLOAD_DIR itself at
+    # UPLOAD_URL_PATH (see the StaticFiles mount in main.py). In
+    # production with a real bucket this would instead be whatever URL the
+    # SDK hands back, e.g.:
     #   s3_client.upload_fileobj(io.BytesIO(data), bucket, key)
     #   url = f"https://{bucket}.s3.amazonaws.com/{key}"
-    fake_url = f"{settings.fake_storage_base_url.rstrip('/')}/{stored_name}"
-    return StoredFile(file_name=filename or stored_name, content_type=content_type, url=fake_url)
+    url = f"{settings.public_base_url.rstrip('/')}{UPLOAD_URL_PATH}/{stored_name}"
+    return StoredFile(file_name=filename or stored_name, content_type=content_type, url=url)

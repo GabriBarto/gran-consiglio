@@ -1,5 +1,6 @@
 import { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import * as authApi from '../api/auth';
+import { onAuthExpired } from '../api/client';
 
 const AuthContext = createContext(null);
 
@@ -13,6 +14,11 @@ export function AuthProvider({ children }) {
       .then(setUser)
       .finally(() => setIsLoading(false));
   }, []);
+
+  // Fires when a stored refresh token is no longer valid (expired, or the
+  // backend restarted and lost its in-memory state) — clear the session even
+  // if nothing on screen explicitly called logout().
+  useEffect(() => onAuthExpired(() => setUser(null)), []);
 
   const value = useMemo(
     () => ({
@@ -36,6 +42,13 @@ export function AuthProvider({ children }) {
       async logout() {
         await authApi.logout();
         setUser(null);
+      },
+      // Re-fetches the profile from the backend (license status changed,
+      // shop created/edited, ...) without a full logout/login round trip.
+      async refreshUser() {
+        const refreshed = await authApi.refreshUser();
+        setUser(refreshed);
+        return refreshed;
       },
     }),
     [user, isLoading]

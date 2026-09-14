@@ -22,6 +22,9 @@ export default function RootLayout() {
           <Stack.Screen name="register-venditore" options={{ title: 'Registrazione venditore' }} />
           <Stack.Screen name="home-cliente" options={{ headerShown: false }} />
           <Stack.Screen name="home-venditore" options={{ headerShown: false }} />
+          <Stack.Screen name="admin" options={{ headerShown: false }} />
+          <Stack.Screen name="shop/[id]" options={{ title: 'Negozio' }} />
+          <Stack.Screen name="orders" options={{ title: 'I miei ordini' }} />
         </Stack>
         <StatusBar style="auto" />
       </AuthProvider>

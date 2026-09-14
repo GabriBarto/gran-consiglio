@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from sqlalchemy.exc import IntegrityError
 
 from .. import geo, storage
 from ..database import Shop, User, db, to_public_shop
@@ -112,7 +113,40 @@ def update_my_shop(payload: ShopRequest, vendor: User = Depends(require_vendor))
 @router.delete("/me", status_code=status.HTTP_204_NO_CONTENT)
 def delete_my_shop(vendor: User = Depends(require_vendor)) -> None:
     shop = _my_shop_or_404(vendor)
-    db.delete_shop(shop.id)
+    try:
+        db.delete_shop(shop.id)
+    except IntegrityError:
+        # orders.storeId has no ON DELETE CASCADE (see app/db/models.py):
+        # a shop with existing bookings can't be deleted, to keep customers'
+        # order history intact. Surface that as a clean 409 instead of a
+        # raw 500.
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Non puoi eliminare questo negozio: ha degli ordini associati.",
+        )
+
+
+@router.put("/me/license", response_model=ShopPublic)
+async def replace_license(
+    license_file: UploadFile = File(..., description="Documento di licenza (PDF, JPEG o PNG)"),
+    vendor: User = Depends(require_vendor),
+) -> ShopPublic:
+    """Lets a vendor (re)upload their license document, e.g. after a
+    rejection or to replace an expired one. Re-uploading resets the review
+    status to pending — only an admin can approve/reject it again."""
+    shop = _my_shop_or_404(vendor)
+    data = await license_file.read()
+    try:
+        stored = storage.save_license_file(
+            user_id=vendor.id, filename=license_file.filename, content_type=license_file.content_type, data=data,
+        )
+    except storage.UploadRejected as exc:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc))
+
+    shop.license_url = stored.url
+    shop.license_status = LicenseStatus.PENDING_REVIEW
+    db.save_shop(shop)
+    return to_public_shop(shop)
 
 
 @router.put("/me/license", response_model=ShopPublic)

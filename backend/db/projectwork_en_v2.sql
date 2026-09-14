@@ -197,6 +197,44 @@ CREATE TABLE `notification` (
   CONSTRAINT `fk_notification_user` FOREIGN KEY (`userId`) REFERENCES `user` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- --------------------------------------------------------
+-- ADDED: three tables for short-lived auth bookkeeping (refresh-token
+-- revocation, email-verification OTPs, password-reset tokens) that used to
+-- live in the API process's memory (lost on every restart). Not part of
+-- the original dump — deliberately additive, same as the `admin` role and
+-- `user.email_verified`/`created_at` columns above. No seed rows: these
+-- are always empty until someone actually registers/logs in/resets.
+-- --------------------------------------------------------
+
+CREATE TABLE `refresh_token` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `jti` varchar(64) NOT NULL,
+  `userId` int(11) NOT NULL,
+  `revoked` tinyint(1) NOT NULL DEFAULT 0,
+  `expiresAt` timestamp NOT NULL,
+  `createdAt` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `jti` (`jti`),
+  KEY `fk_refreshtoken_user` (`userId`),
+  CONSTRAINT `fk_refreshtoken_user` FOREIGN KEY (`userId`) REFERENCES `user` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE `email_verification` (
+  `userId` int(11) NOT NULL,
+  `otp` varchar(6) NOT NULL,
+  `expiresAt` timestamp NOT NULL,
+  PRIMARY KEY (`userId`),
+  CONSTRAINT `fk_emailverification_user` FOREIGN KEY (`userId`) REFERENCES `user` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE `password_reset` (
+  `userId` int(11) NOT NULL,
+  `jti` varchar(64) NOT NULL,
+  `expiresAt` timestamp NOT NULL,
+  PRIMARY KEY (`userId`),
+  CONSTRAINT `fk_passwordreset_user` FOREIGN KEY (`userId`) REFERENCES `user` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- ---------------------------------------------------------------------
 -- Seed data (fake/demo data — no real external data yet).
 -- 4 rows for `user` and `store`, 2 rows for every other table.

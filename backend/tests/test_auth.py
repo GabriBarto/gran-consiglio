@@ -12,6 +12,7 @@ backend/db/projectwork_en_v2.sql before the session starts).
 from __future__ import annotations
 
 import io
+from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 
@@ -48,9 +49,9 @@ def test_register_login_and_refresh_flow():
     assert dup.status_code == 409
 
     # Verify email via the OTP that was "sent" (captured straight from the
-    # in-memory bookkeeping, since there's no real mailbox in tests).
+    # DB bookkeeping table, since there's no real mailbox in tests).
     user = db.get_by_email("new.customer@example.com")
-    otp = db.pending_verifications[user.id]["otp"]
+    otp = db.get_pending_verification(user.id)["otp"]
     verify = client.post("/auth/verify-email", json={"email": user.email, "otp": otp})
     assert verify.status_code == 200, verify.text
 
@@ -113,7 +114,11 @@ def test_forgot_and_reset_password():
     from app import security
 
     jwt_token = security.create_password_reset_token(user.id)
-    db.pending_resets[user.id] = {"jti": security.decode_token(jwt_token, expected_purpose="password_reset")["jti"]}
+    db.set_pending_reset(
+        user.id,
+        jti=security.decode_token(jwt_token, expected_purpose="password_reset")["jti"],
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=30),
+    )
 
     reset = client.post(
         "/auth/reset-password",

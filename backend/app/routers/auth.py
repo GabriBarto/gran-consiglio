@@ -47,10 +47,11 @@ def _start_email_verification(user: User) -> None:
     one can be used to complete verification."""
     token = security.create_email_verification_token(user.id)
     otp = security.generate_otp()
-    db.pending_verifications[user.id] = {
-        "otp": otp,
-        "expires_at": datetime.now(timezone.utc) + timedelta(minutes=settings.email_verification_expire_minutes),
-    }
+    db.set_pending_verification(
+        user.id,
+        otp=otp,
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=settings.email_verification_expire_minutes),
+    )
     email_utils.send_verification_email(to=user.email, token=token, otp=otp)
 
 
@@ -58,7 +59,11 @@ def _issue_token_pair(user: User) -> TokenPair:
     access = security.create_access_token(user.id)
     refresh = security.create_refresh_token(user.id)
     refresh_payload = security.decode_token(refresh, expected_purpose="refresh")
-    db.refresh_tokens[refresh_payload["jti"]] = {"user_id": user.id, "revoked": False}
+    db.create_refresh_token(
+        jti=refresh_payload["jti"],
+        user_id=user.id,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=settings.refresh_token_expire_days),
+    )
     return TokenPair(access_token=access, refresh_token=refresh)
 
 
@@ -179,7 +184,7 @@ def verify_email(payload: VerifyEmailRequest) -> MessageResponse:
         user = db.get_by_id(data["sub"])
     else:
         user = db.get_by_email(payload.email)
-        pending = db.pending_verifications.get(user.id) if user else None
+        pending = db.get_pending_verification(user.id) if user else None
         otp_valid = (
             pending is not None
             and pending["otp"] == payload.otp
@@ -193,7 +198,7 @@ def verify_email(payload: VerifyEmailRequest) -> MessageResponse:
 
     user.email_verified = True
     db.save(user)
-    db.pending_verifications.pop(user.id, None)
+    db.clear_pending_verification(user.id)
     return MessageResponse(message="Email verificata con successo.")
 
 
@@ -227,7 +232,7 @@ def refresh_token(payload: RefreshRequest) -> TokenPair:
     except ValueError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Refresh token non valido o scaduto.")
 
-    record = db.refresh_tokens.get(data["jti"])
+    record = db.get_refresh_token(data["jti"])
     if not record or record["revoked"]:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Refresh token non valido o già utilizzato.")
 
@@ -237,7 +242,7 @@ def refresh_token(payload: RefreshRequest) -> TokenPair:
 
     # Rotate: the old refresh token is single-use — invalidate it and hand
     # back a brand new access/refresh pair.
-    record["revoked"] = True
+    db.revoke_refresh_token(data["jti"])
     return _issue_token_pair(user)
 
 
@@ -251,7 +256,11 @@ def forgot_password(payload: ForgotPasswordRequest) -> MessageResponse:
     if user:
         token = security.create_password_reset_token(user.id)
         payload_claims = security.decode_token(token, expected_purpose="password_reset")
-        db.pending_resets[user.id] = {"jti": payload_claims["jti"]}
+        db.set_pending_reset(
+            user.id,
+            jti=payload_claims["jti"],
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=settings.password_reset_expire_minutes),
+        )
         email_utils.send_password_reset_email(to=user.email, token=token)
 
     # Same response regardless of whether the email exists, to avoid
@@ -267,11 +276,11 @@ def reset_password(payload: ResetPasswordRequest) -> MessageResponse:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Token non valido o scaduto.")
 
     user = db.get_by_id(data["sub"])
-    pending = db.pending_resets.get(user.id) if user else None
+    pending = db.get_pending_reset(user.id) if user else None
     if not user or not pending or pending["jti"] != data["jti"]:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Token non valido o già utilizzato.")
 
     user.password_hash = security.hash_password(payload.new_password)
     db.save(user)
-    db.pending_resets.pop(user.id, None)
+    db.clear_pending_reset(user.id)
     return MessageResponse(message="Password aggiornata con successo.")
