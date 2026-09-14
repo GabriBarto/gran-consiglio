@@ -1,6 +1,8 @@
 """
-Admin-only endpoints. Currently just shop license-status moderation: list
-shops (optionally filtered by review status) and approve/reject one.
+Admin-only endpoints. Shop license-status moderation (list shops
+optionally filtered by review status, approve/reject one) and review
+moderation (list reported reviews, remove/restore one — see
+routers/reviews.py for the user-facing create/read/report side).
 
 There is no public way to become an admin (see UserRole.ADMIN in
 schemas.py) — admin accounts only exist as seeded fake data for now.
@@ -13,7 +15,15 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 
 from ..database import User, db, to_public_shop
 from ..dependencies import require_admin
-from ..schemas import AdminShopPublic, LicenseStatus, ShopLicenseStatusUpdate, ShopPublic
+from ..schemas import (
+    AdminReportedReviewPublic,
+    AdminShopPublic,
+    LicenseStatus,
+    ReviewModerationUpdate,
+    ReviewPublic,
+    ShopLicenseStatusUpdate,
+    ShopPublic,
+)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -57,3 +67,25 @@ def set_shop_license_status(
     shop.license_status = payload.status
     db.save_shop(shop)
     return to_public_shop(shop)
+
+
+# ---------------------------------------------------------------------------
+# Review moderation
+# ---------------------------------------------------------------------------
+
+@router.get("/reviews/reported", response_model=List[AdminReportedReviewPublic])
+def list_reported_reviews(admin: User = Depends(require_admin)) -> List[AdminReportedReviewPublic]:
+    return db.list_reported_reviews()
+
+
+@router.patch("/reviews/{review_id}", response_model=ReviewPublic)
+def set_review_removed(
+    review_id: str, payload: ReviewModerationUpdate, admin: User = Depends(require_admin)
+) -> ReviewPublic:
+    """removed=true hides the review from public reads (see
+    routers/reviews.py); removed=false restores one, e.g. after rejecting
+    a report as unfounded."""
+    try:
+        return db.set_review_removed(review_id, removed=payload.removed)
+    except ValueError:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Recensione non trovata.")

@@ -411,3 +411,74 @@ class OrderStateUpdate(BaseModel):
 
 class ShopLicenseStatusUpdate(BaseModel):
     status: LicenseStatus
+
+
+# ---------------------------------------------------------------------------
+# Reviews (left on a picked-up order — see routers/reviews.py)
+# ---------------------------------------------------------------------------
+
+class ReviewRequest(BaseModel):
+    """Shared shape for creating and (fully) updating a review. `text` is
+    optional on input — an omitted/blank text is stored as "" (the DB
+    column is NOT NULL, see backend/db/projectwork_en_v2.sql), not sent
+    back on read (ReviewPublic.text is always a str, possibly empty)."""
+
+    rating: int = Field(..., ge=1, le=5, description="Voto da 1 a 5")
+    text: Optional[str] = Field(None, description="Testo della recensione (opzionale)")
+
+    @field_validator("text")
+    @classmethod
+    def _check_text(cls, v: Optional[str]) -> str:
+        trimmed = (v or "").strip()
+        if len(trimmed) > 500:  # varchar(500) in the DB
+            raise ValueError("Il testo della recensione non può superare 500 caratteri.")
+        return trimmed
+
+
+class ReviewPublic(BaseModel):
+    id: str
+    order_id: str
+    shop_id: str
+    user_id: str
+    author_username: str
+    rating: int
+    text: str
+    created_at: datetime
+
+
+class ReviewListResponse(BaseModel):
+    total: int
+    limit: int
+    offset: int
+    average_rating: Optional[float] = Field(None, description="Media dei voti non rimossi, arrotondata a 2 decimali")
+    items: List[ReviewPublic]
+
+
+class ReviewReportRequest(BaseModel):
+    reason: Optional[str] = Field(None, description="Motivazione della segnalazione (opzionale)")
+
+    @field_validator("reason")
+    @classmethod
+    def _check_reason(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return None
+        trimmed = v.strip()
+        if len(trimmed) > 255:  # varchar(255) in the DB
+            raise ValueError("La motivazione non può superare 255 caratteri.")
+        return trimmed or None
+
+
+class AdminReportedReviewPublic(ReviewPublic):
+    """ReviewPublic plus moderation-only info — only exposed to admins
+    reviewing the flagged queue (GET /admin/reviews/reported)."""
+
+    is_removed: bool
+    report_count: int
+
+
+class ReviewModerationUpdate(BaseModel):
+    """Admin-only transition on a review's visibility (see
+    PATCH /admin/reviews/{review_id}): true removes it (hidden from public
+    reads, kept for audit), false restores a previously removed one."""
+
+    removed: bool

@@ -235,6 +235,34 @@ CREATE TABLE `password_reset` (
   CONSTRAINT `fk_passwordreset_user` FOREIGN KEY (`userId`) REFERENCES `user` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
+-- --------------------------------------------------------
+-- ADDED: review moderation support. `review` already existed in the
+-- original dump but had no way to enforce "one review per order" at the
+-- DB level and no soft-delete flag; `review_report` is a new table for
+-- user-submitted flags. Deliberately additive (same spirit as the
+-- refresh_token/email_verification/password_reset block above) — no
+-- existing column is changed or removed, so it never invalidates the
+-- seed data already inserted below.
+-- --------------------------------------------------------
+
+ALTER TABLE `review`
+  ADD COLUMN `isRemoved` tinyint(1) NOT NULL DEFAULT 0 AFTER `text`,
+  ADD UNIQUE KEY `uq_review_order` (`orderId`);
+
+CREATE TABLE `review_report` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `reviewId` int(11) NOT NULL,
+  `userId` int(11) NOT NULL,
+  `reason` varchar(255) DEFAULT NULL,
+  `date` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uq_reviewreport_review_user` (`reviewId`, `userId`),
+  KEY `fk_reviewreport_review` (`reviewId`),
+  KEY `fk_reviewreport_user` (`userId`),
+  CONSTRAINT `fk_reviewreport_review` FOREIGN KEY (`reviewId`) REFERENCES `review` (`id`) ON DELETE CASCADE,
+  CONSTRAINT `fk_reviewreport_user` FOREIGN KEY (`userId`) REFERENCES `user` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
 -- ---------------------------------------------------------------------
 -- Seed data (fake/demo data — no real external data yet).
 -- 4 rows for `user` and `store`, 2 rows for every other table.

@@ -26,7 +26,10 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, time as dt_time, timezone
 from decimal import Decimal
-from typing import List, Optional
+from typing import List, Optional, Tuple
+
+from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 from .db.engine import get_session
 from .db.models import (
@@ -38,16 +41,20 @@ from .db.models import (
     OrderRow,
     PasswordResetRow,
     RefreshTokenRow,
+    ReviewReportRow,
+    ReviewRow,
     StoreRow,
     UserRow,
 )
 from .schemas import (
+    AdminReportedReviewPublic,
     BoxPublic,
     CartItemPublic,
     CartPublic,
     LicenseStatus,
     OrderItemPublic,
     OrderPublic,
+    ReviewPublic,
     ShopPublic,
     UserPublic,
     UserRole,
@@ -759,6 +766,165 @@ class Repository:
             order.state = "pickedUp"
             session.flush()
             return self._order_public(session, order)
+
+    # -- reviews ------------------------------------------------------
+    def _review_public(self, review: ReviewRow, *, author_username: str) -> ReviewPublic:
+        return ReviewPublic(
+            id=str(review.id),
+            order_id=str(review.order_id),
+            shop_id=str(review.shop_id),
+            user_id=str(review.user_id),
+            author_username=author_username,
+            rating=int(review.rating),
+            text=review.text,
+            created_at=_as_utc(review.created_at),
+        )
+
+    def _usernames_by_id(self, session, user_ids: set[int]) -> dict[int, str]:
+        """Batch lookup to avoid an N+1 query per review when building a
+        list (see list_reviews_for_shop / list_reported_reviews)."""
+        if not user_ids:
+            return {}
+        return {u.id: u.username for u in session.query(UserRow).filter(UserRow.id.in_(user_ids)).all()}
+
+    def create_review(self, *, order_id: str, user_id: str, rating: int, text: str) -> ReviewPublic:
+        """Requires the order to already be 'pickedUp' and to have no
+        review yet — both checked here, with the DB's UNIQUE key on
+        review.orderId (see backend/db/projectwork_en_v2.sql) as the final
+        guard against two concurrent requests both passing the check."""
+        with get_session() as session:
+            order = session.get(OrderRow, int(order_id))
+            if not order:
+                raise ValueError("order_not_found")
+            if order.state != "pickedUp":
+                raise ValueError("not_picked_up")
+            existing = session.query(ReviewRow).filter(ReviewRow.order_id == order.id).one_or_none()
+            if existing:
+                raise ValueError("already_reviewed")
+
+            review = ReviewRow(
+                order_id=order.id, user_id=int(user_id), shop_id=order.shop_id, rating=rating, text=text
+            )
+            session.add(review)
+            try:
+                session.flush()
+            except IntegrityError:
+                raise ValueError("already_reviewed")
+            session.refresh(review)
+            author = session.get(UserRow, int(user_id))
+            return self._review_public(review, author_username=author.username if author else "—")
+
+    def get_review(self, review_id: str, *, include_removed: bool = False) -> Optional[ReviewPublic]:
+        try:
+            rid = int(review_id)
+        except (TypeError, ValueError):
+            return None
+        with get_session() as session:
+            review = session.get(ReviewRow, rid)
+            if not review or (review.is_removed and not include_removed):
+                return None
+            author = session.get(UserRow, review.user_id)
+            return self._review_public(review, author_username=author.username if author else "—")
+
+    def get_review_owner_id(self, review_id: str) -> Optional[str]:
+        """For ownership checks (PUT/DELETE /reviews/{id}) — a removed
+        review counts as not-found here too, same as it does for reads."""
+        try:
+            rid = int(review_id)
+        except (TypeError, ValueError):
+            return None
+        with get_session() as session:
+            review = session.get(ReviewRow, rid)
+            if not review or review.is_removed:
+                return None
+            return str(review.user_id)
+
+    def update_review(self, review_id: str, *, rating: int, text: str) -> ReviewPublic:
+        with get_session() as session:
+            review = session.get(ReviewRow, int(review_id))
+            if not review or review.is_removed:
+                raise ValueError("review_not_found")
+            review.rating = rating
+            review.text = text
+            session.flush()
+            author = session.get(UserRow, review.user_id)
+            return self._review_public(review, author_username=author.username if author else "—")
+
+    def set_review_removed(self, review_id: str, *, removed: bool) -> ReviewPublic:
+        """Soft delete/restore — shared by the author's own DELETE
+        /reviews/{id} and the admin moderation PATCH /admin/reviews/{id},
+        so a removed review is always just isRemoved=1, never an actual
+        DELETE (moderation needs to be able to inspect it afterwards)."""
+        with get_session() as session:
+            review = session.get(ReviewRow, int(review_id))
+            if not review:
+                raise ValueError("review_not_found")
+            review.is_removed = removed
+            session.flush()
+            author = session.get(UserRow, review.user_id)
+            return self._review_public(review, author_username=author.username if author else "—")
+
+    def list_reviews_for_shop(
+        self, shop_id: str, *, limit: int, offset: int
+    ) -> Tuple[List[ReviewPublic], int, Optional[float]]:
+        with get_session() as session:
+            total, avg = (
+                session.query(func.count(ReviewRow.id), func.avg(ReviewRow.rating))
+                .filter(ReviewRow.shop_id == int(shop_id), ReviewRow.is_removed.is_(False))
+                .one()
+            )
+            rows = (
+                session.query(ReviewRow)
+                .filter(ReviewRow.shop_id == int(shop_id), ReviewRow.is_removed.is_(False))
+                .order_by(ReviewRow.created_at.desc())
+                .offset(offset)
+                .limit(limit)
+                .all()
+            )
+            usernames = self._usernames_by_id(session, {r.user_id for r in rows})
+            items = [self._review_public(r, author_username=usernames.get(r.user_id, "—")) for r in rows]
+            average = round(float(avg), 2) if avg is not None else None
+            return items, total, average
+
+    def report_review(self, review_id: str, *, user_id: str, reason: Optional[str]) -> None:
+        with get_session() as session:
+            review = session.get(ReviewRow, int(review_id))
+            if not review:
+                raise ValueError("review_not_found")
+            existing = (
+                session.query(ReviewReportRow)
+                .filter(ReviewReportRow.review_id == review.id, ReviewReportRow.user_id == int(user_id))
+                .one_or_none()
+            )
+            if existing:
+                raise ValueError("already_reported")
+            session.add(ReviewReportRow(review_id=review.id, user_id=int(user_id), reason=reason))
+            try:
+                session.flush()
+            except IntegrityError:
+                raise ValueError("already_reported")
+
+    def list_reported_reviews(self) -> List[AdminReportedReviewPublic]:
+        """One review per row it appears in review_report, with its report
+        count computed via SQL GROUP BY (not a Python loop over all
+        reports) — includes already-removed reviews, so an admin can see
+        what was already acted on."""
+        with get_session() as session:
+            rows = (
+                session.query(ReviewRow, func.count(ReviewReportRow.id))
+                .join(ReviewReportRow, ReviewReportRow.review_id == ReviewRow.id)
+                .group_by(ReviewRow.id)
+                .order_by(func.count(ReviewReportRow.id).desc())
+                .all()
+            )
+            usernames = self._usernames_by_id(session, {review.user_id for review, _ in rows})
+            result = []
+            for review, count in rows:
+                base = self._review_public(review, author_username=usernames.get(review.user_id, "—"))
+                result.append(
+                    AdminReportedReviewPublic(**base.model_dump(), is_removed=bool(review.is_removed), report_count=int(count))
+                )
+            return result
 
 
 db = Repository()

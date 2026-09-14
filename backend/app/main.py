@@ -20,7 +20,7 @@ from sqlalchemy.exc import OperationalError
 
 from . import storage
 from .db.engine import engine
-from .routers import admin, auth, boxes, cart, orders, shops, users
+from .routers import admin, auth, boxes, cart, orders, reviews, shops, users
 
 logger = logging.getLogger("toogood.startup")
 
@@ -63,6 +63,7 @@ app.include_router(shops.router)
 app.include_router(boxes.router)
 app.include_router(cart.router)
 app.include_router(orders.router)
+app.include_router(reviews.router)
 app.include_router(admin.router)
 
 # Serves uploaded vendor licenses at real, working URLs (see storage.py) —

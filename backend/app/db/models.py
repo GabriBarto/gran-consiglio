@@ -4,9 +4,9 @@ backend/db/projectwork_en_v2.sql: `user`, `store`, `box`, `cart`/`cart_item`
 and `orders`/`order_item` (the tables the app's core features read/write),
 `refresh_token`/`email_verification`/`password_reset` (short-lived auth
 bookkeeping, persisted here instead of in-process memory so it survives an
-API restart — see app/database.py), and `review`/`notification`, which
-exist in the schema+seed data for future features but have no endpoints
-yet.
+API restart — see app/database.py), and `review`/`review_report` (see
+routers/reviews.py). `notification` exists in the schema+seed data for a
+future feature but has no endpoints yet.
 
 Python attribute names favor readability (e.g. `vendor_id`, `license_url`)
 while `mapped_column("dbColumnName", ...)` keeps them wired to the schema's
@@ -158,6 +158,38 @@ class OrderItemRow(Base):
     unit_price: Mapped[float] = mapped_column("unitPrice", Float)
 
     order: Mapped["OrderRow"] = relationship(back_populates="items")
+
+
+class ReviewRow(Base):
+    """A customer's review of a picked-up order (see routers/reviews.py).
+    `isRemoved` is a soft-delete flag set by the author or by admin
+    moderation — never a hard DELETE, so a removed review stays available
+    for moderation/audit instead of disappearing outright."""
+
+    __tablename__ = "review"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    order_id: Mapped[int] = mapped_column("orderId", ForeignKey("orders.id", ondelete="CASCADE"))
+    user_id: Mapped[int] = mapped_column("userId", ForeignKey("user.id", ondelete="CASCADE"))
+    shop_id: Mapped[int] = mapped_column("storeId", ForeignKey("store.id", ondelete="CASCADE"))
+    rating: Mapped[float] = mapped_column(Float)
+    text: Mapped[str] = mapped_column(String(500))
+    is_removed: Mapped[bool] = mapped_column("isRemoved", Boolean, default=False)
+    created_at: Mapped[datetime] = mapped_column("date", TIMESTAMP, server_default=func.current_timestamp())
+
+
+class ReviewReportRow(Base):
+    """One user's flag on a review (see POST /reviews/{id}/report). At
+    most one report per (review, user) — enforced by a DB unique key, not
+    just app logic — so a single user can't inflate the reported queue."""
+
+    __tablename__ = "review_report"
+
+    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
+    review_id: Mapped[int] = mapped_column("reviewId", ForeignKey("review.id", ondelete="CASCADE"))
+    user_id: Mapped[int] = mapped_column("userId", ForeignKey("user.id", ondelete="CASCADE"))
+    reason: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    created_at: Mapped[datetime] = mapped_column("date", TIMESTAMP, server_default=func.current_timestamp())
 
 
 class RefreshTokenRow(Base):
