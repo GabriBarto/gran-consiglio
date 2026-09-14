@@ -1,0 +1,272 @@
+// Schema del database — vedi docs/implementation-plan.md per il contesto.
+// Stack: MySQL + Prisma.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Utenti e ruoli
+// ---------------------------------------------------------------------------
+
+enum Ruolo {
+  CLIENTE
+  VENDITORE
+  ADMIN
+}
+
+model Utente {
+  id            Int      @id @default(autoincrement())
+  role          Ruolo    @default(CLIENTE)
+  username      String   @unique
+  email         String   @unique
+  passwordHash  String
+  emailVerified Boolean  @default(false)
+  createdAt     DateTime @default(now())
+
+  negozio                 Negozio?
+  carrelli                Carrello[]
+  ordini                  Ordine[]
+  recensioni              Recensione[]
+  notifiche               Notifica[]
+  emailVerificationTokens EmailVerificationToken[]
+  passwordResetTokens     PasswordResetToken[]
+  refreshTokens           RefreshToken[]
+
+  @@map("utente")
+}
+
+model EmailVerificationToken {
+  id        Int       @id @default(autoincrement())
+  userId    Int
+  utente    Utente    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@map("email_verification_token")
+}
+
+model PasswordResetToken {
+  id        Int       @id @default(autoincrement())
+  userId    Int
+  utente    Utente    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@map("password_reset_token")
+}
+
+model RefreshToken {
+  id        Int       @id @default(autoincrement())
+  userId    Int
+  utente    Utente    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String    @unique
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@map("refresh_token")
+}
+
+// ---------------------------------------------------------------------------
+// Negozio (venditore)
+// ---------------------------------------------------------------------------
+
+enum StatoVerifica {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model Negozio {
+  id             Int           @id @default(autoincrement())
+  userId         Int           @unique
+  utente         Utente        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  nome           String
+  indirizzo      String
+  lat            Float
+  lng            Float
+  telefono       String?
+  licenzaUrl     String?
+  statoVerifica  StatoVerifica @default(PENDING)
+  motivoRifiuto  String?
+  orarioApertura String?
+  fasciaRitiro   String?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  box        Box[]
+  carrelli   Carrello[]
+  ordini     Ordine[]
+  recensioni Recensione[]
+
+  @@index([lat, lng])
+  @@map("negozio")
+}
+
+// ---------------------------------------------------------------------------
+// Box
+// ---------------------------------------------------------------------------
+
+model CategoriaBox {
+  id   Int    @id @default(autoincrement())
+  nome String @unique
+
+  box Box[]
+
+  @@map("categoria_box")
+}
+
+model Box {
+  id            Int           @id @default(autoincrement())
+  negozioId     Int
+  negozio       Negozio       @relation(fields: [negozioId], references: [id], onDelete: Cascade)
+  nome          String
+  descrizione   String?       @db.Text
+  prezzo        Decimal       @db.Decimal(10, 2)
+  foto          String?
+  categoriaId   Int?
+  categoria     CategoriaBox? @relation(fields: [categoriaId], references: [id])
+  maxBox        Int
+  soldBoxes     Int           @default(0)
+  allergeni     String?       @db.Text
+  fasciaRitiro  String?
+  dataCreazione DateTime      @default(now())
+  dataScadenza  DateTime?
+
+  carrelloItems CarrelloItem[]
+  ordineItems   OrdineItem[]
+
+  @@index([negozioId])
+  @@map("box")
+}
+
+// ---------------------------------------------------------------------------
+// Carrello (uno per negozio per utente, come da requisito)
+// ---------------------------------------------------------------------------
+
+enum StatoCarrello {
+  ATTIVO
+  COMPLETATO
+}
+
+model Carrello {
+  id        Int           @id @default(autoincrement())
+  userId    Int
+  utente    Utente        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  negozioId Int
+  negozio   Negozio       @relation(fields: [negozioId], references: [id], onDelete: Cascade)
+  stato     StatoCarrello @default(ATTIVO)
+  createdAt DateTime      @default(now())
+
+  items CarrelloItem[]
+
+  @@index([userId])
+  @@index([negozioId])
+  @@map("carrello")
+}
+
+model CarrelloItem {
+  id            Int       @id @default(autoincrement())
+  carrelloId    Int
+  carrello      Carrello  @relation(fields: [carrelloId], references: [id], onDelete: Cascade)
+  boxId         Int
+  box           Box       @relation(fields: [boxId], references: [id])
+  quantita      Int
+  // riserva temporanea dello stock finché non scade o si completa il pagamento
+  riservatoFino DateTime?
+
+  @@unique([carrelloId, boxId])
+  @@map("carrello_item")
+}
+
+// ---------------------------------------------------------------------------
+// Ordine
+// ---------------------------------------------------------------------------
+
+enum StatoOrdine {
+  IN_ATTESA_PAGAMENTO
+  PAGATO
+  PRONTO_PER_RITIRO
+  RITIRATO
+  ANNULLATO
+  SCADUTO
+}
+
+model Ordine {
+  id                    Int         @id @default(autoincrement())
+  userId                Int
+  utente                Utente      @relation(fields: [userId], references: [id])
+  negozioId             Int
+  negozio               Negozio     @relation(fields: [negozioId], references: [id])
+  totalPrice            Decimal     @db.Decimal(10, 2)
+  stato                 StatoOrdine @default(IN_ATTESA_PAGAMENTO)
+  dataOrdine            DateTime    @default(now())
+  fasciaRitiro          String?
+  stripePaymentIntentId String?
+
+  items      OrdineItem[]
+  recensione Recensione?
+
+  @@index([userId])
+  @@index([negozioId])
+  @@map("ordine")
+}
+
+model OrdineItem {
+  id             Int     @id @default(autoincrement())
+  ordineId       Int
+  ordine         Ordine  @relation(fields: [ordineId], references: [id], onDelete: Cascade)
+  boxId          Int
+  box            Box     @relation(fields: [boxId], references: [id])
+  quantita       Int
+  prezzoUnitario Decimal @db.Decimal(10, 2)
+
+  @@map("ordine_item")
+}
+
+// ---------------------------------------------------------------------------
+// Recensioni e notifiche
+// ---------------------------------------------------------------------------
+
+model Recensione {
+  id        Int      @id @default(autoincrement())
+  ordineId  Int      @unique
+  ordine    Ordine   @relation(fields: [ordineId], references: [id])
+  userId    Int
+  utente    Utente   @relation(fields: [userId], references: [id])
+  negozioId Int
+  negozio   Negozio  @relation(fields: [negozioId], references: [id])
+  voto      Int
+  testo     String?  @db.Text
+  segnalata Boolean  @default(false)
+  data      DateTime @default(now())
+
+  @@index([negozioId])
+  @@map("recensione")
+}
+
+model Notifica {
+  id     Int      @id @default(autoincrement())
+  userId Int
+  utente Utente   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tipo   String
+  testo  String
+  letta  Boolean  @default(false)
+  data   DateTime @default(now())
+
+  @@index([userId])
+  @@map("notifica")
+}
