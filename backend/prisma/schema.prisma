@@ -1,13 +1,14 @@
 // Schema del database — vedi docs/implementation-plan.md per il contesto.
-// Stack: MySQL + Prisma.
+// Stack: PostgreSQL (Neon) + Prisma.
 
 generator client {
   provider = "prisma-client-js"
 }
 
 datasource db {
-  provider = "mysql"
-  url      = env("DATABASE_URL")
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
 }
 
 // ---------------------------------------------------------------------------
