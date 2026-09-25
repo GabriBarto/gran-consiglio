@@ -147,15 +147,10 @@ export async function apiRequest(path, options = {}) {
   return data;
 }
 
-// Files the backend serves itself (uploaded licenses) come back as absolute
-// URLs built from the backend's PUBLIC_BASE_URL at upload time (see
-// backend/app/storage.py), which defaults to 127.0.0.1 and can go stale if
-// the backend's address changes. Re-point them at the address this app
-// actually talks to, keeping only the path.
-export function resolveBackendFileUrl(url) {
-  if (!url) return null;
-  const match = url.match(/^https?:\/\/[^/]+(\/.*)$/);
-  return match ? `${getBaseUrl()}${match[1]}` : url;
+// Absolute URL for a path on the backend, for links opened outside
+// apiRequest (e.g. a license download link in a new browser tab).
+export function backendUrl(path) {
+  return `${getBaseUrl()}${path}`;
 }
 
 export async function storeTokens(tokens) {

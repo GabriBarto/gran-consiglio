@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { ActivityIndicator, FlatList, Linking, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { listShopsForReview, setShopLicenseStatus } from '../src/api/admin';
-import { resolveBackendFileUrl } from '../src/api/client';
+import { getLicenseLink } from '../src/api/shops';
 import PrimaryButton from '../src/components/PrimaryButton';
 import { useAuth } from '../src/context/AuthContext';
 import { colors, radius, spacing } from '../src/theme';
@@ -33,6 +33,7 @@ export default function AdminPanel() {
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState(null);
   const [busyShopId, setBusyShopId] = useState(null);
+  const [openingLicenseId, setOpeningLicenseId] = useState(null);
 
   const load = useCallback(async (statusFilter) => {
     setIsLoading(true);
@@ -87,21 +88,24 @@ export default function AdminPanel() {
     }
   }
 
-  async function handleOpenLicense(licenseUrl) {
-    const url = resolveBackendFileUrl(licenseUrl);
-    if (!url) {
-      setError('Nessun documento caricato per questo negozio.');
-      return;
-    }
+  async function handleOpenLicense(shopId) {
+    // On web, open the tab synchronously inside the click: browsers block
+    // window.open() calls made after an await as popups.
+    const tab = Platform.OS === 'web' ? window.open('', '_blank') : null;
+    setOpeningLicenseId(shopId);
     try {
-      if (Platform.OS === 'web') {
-        // New tab, so the admin doesn't lose the review queue.
-        window.open(url, '_blank', 'noopener');
+      const url = await getLicenseLink(shopId);
+      if (tab) {
+        tab.opener = null;
+        tab.location.href = url;
       } else {
         await Linking.openURL(url);
       }
     } catch (err) {
+      tab?.close();
       setError(`Impossibile aprire il documento: ${err.message}`);
+    } finally {
+      setOpeningLicenseId(null);
     }
   }
 
@@ -164,7 +168,8 @@ export default function AdminPanel() {
             <PrimaryButton
               title="📄 Vedi documento"
               variant="outline"
-              onPress={() => handleOpenLicense(item.license_url)}
+              onPress={() => handleOpenLicense(item.id)}
+              loading={openingLicenseId === item.id}
               style={styles.licenseButton}
             />
             <View style={styles.actionsRow}>

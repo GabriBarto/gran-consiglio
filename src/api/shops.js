@@ -6,7 +6,7 @@
 // a per-weekday schedule — the real DB schema doesn't model that), and a
 // free-text address (no separate city column).
 // ---------------------------------------------------------------------------
-import { apiRequest } from './client';
+import { apiRequest, backendUrl } from './client';
 import { toUploadFile } from '../utils/files';
 
 function buildQuery(params) {
@@ -51,6 +51,18 @@ export async function createShop({ licenseFile, ...fields }) {
   form.append('pickup_window_end', fields.pickup_window_end);
   form.append('license_file', toUploadFile(licenseFile), licenseFile.name ?? 'licenza');
   return apiRequest('/shops', { method: 'POST', auth: true, form });
+}
+
+// License documents aren't public: this asks the backend for a download
+// link valid a few minutes (admin or the shop's own vendor only), which
+// can then be opened in a browser tab / the phone's viewer without our
+// Bearer header. Returns the absolute URL.
+export async function getLicenseLink(shopId) {
+  const { path } = await apiRequest(`/shops/${encodeURIComponent(shopId)}/license/link`, {
+    method: 'POST',
+    auth: true,
+  });
+  return backendUrl(path);
 }
 
 export async function updateMyShop(payload) {

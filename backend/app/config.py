@@ -57,6 +57,9 @@ class Settings(BaseSettings):
     # absolute path here (env var) to point at a different location.
     license_storage_dir: str = "uploads/licenses"
     max_license_size_mb: int = 10
+    # How long a license download link (POST /shops/{id}/license/link)
+    # stays valid. Short on purpose: the token travels in the URL.
+    license_link_expire_minutes: int = 5
 
     # Where THIS API is publicly reachable from clients — used to build
     # real, working URLs for files it serves itself (uploaded licenses).
