@@ -1,8 +1,9 @@
 import { Redirect, useRouter } from 'expo-router';
 import { useCallback, useEffect, useState } from 'react';
-import { ActivityIndicator, FlatList, Pressable, StyleSheet, Text, View } from 'react-native';
+import { ActivityIndicator, FlatList, Linking, Platform, Pressable, StyleSheet, Text, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { listShopsForReview, setShopLicenseStatus } from '../src/api/admin';
+import { resolveBackendFileUrl } from '../src/api/client';
 import PrimaryButton from '../src/components/PrimaryButton';
 import { useAuth } from '../src/context/AuthContext';
 import { colors, radius, spacing } from '../src/theme';
@@ -86,6 +87,24 @@ export default function AdminPanel() {
     }
   }
 
+  async function handleOpenLicense(licenseUrl) {
+    const url = resolveBackendFileUrl(licenseUrl);
+    if (!url) {
+      setError('Nessun documento caricato per questo negozio.');
+      return;
+    }
+    try {
+      if (Platform.OS === 'web') {
+        // New tab, so the admin doesn't lose the review queue.
+        window.open(url, '_blank', 'noopener');
+      } else {
+        await Linking.openURL(url);
+      }
+    } catch (err) {
+      setError(`Impossibile aprire il documento: ${err.message}`);
+    }
+  }
+
   async function handleLogout() {
     await logout();
     router.replace('/');
@@ -142,6 +161,12 @@ export default function AdminPanel() {
               {item.address} · 📞 {item.phone}
             </Text>
             <Text style={styles.cardStatus}>{STATUS_LABEL[item.license_status]}</Text>
+            <PrimaryButton
+              title="📄 Vedi documento"
+              variant="outline"
+              onPress={() => handleOpenLicense(item.license_url)}
+              style={styles.licenseButton}
+            />
             <View style={styles.actionsRow}>
               {item.license_status !== 'approved' ? (
                 <PrimaryButton
@@ -232,5 +257,6 @@ const styles = StyleSheet.create({
   cardMeta: { fontSize: 13, color: colors.textMuted, marginTop: spacing.xs },
   cardStatus: { fontSize: 14, fontWeight: '700', color: colors.text, marginTop: spacing.sm },
   actionsRow: { flexDirection: 'row', gap: spacing.sm, marginTop: spacing.md, flexWrap: 'wrap' },
+  licenseButton: { marginTop: spacing.sm },
   actionButton: { flexGrow: 1, minWidth: 100 },
 });
