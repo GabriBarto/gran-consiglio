@@ -319,6 +319,14 @@ class BoxPublic(BaseModel):
     created_at: datetime
 
 
+class LicenseLinkResponse(BaseModel):
+    """Returned by POST /shops/{id}/license/link: a path (relative to the
+    API's base URL) that downloads the license document for a few minutes."""
+
+    path: str
+    expires_in_minutes: int
+
+
 class AdminShopPublic(ShopPublic):
     """ShopPublic plus the vendor's own account info — only exposed to
     admins reviewing the license queue (GET /admin/shops), where knowing

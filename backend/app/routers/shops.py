@@ -10,12 +10,14 @@ from __future__ import annotations
 from typing import Optional
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile, status
+from fastapi.responses import FileResponse
 from sqlalchemy.exc import IntegrityError
 
-from .. import geo, storage
+from .. import geo, security, storage
+from ..config import settings
 from ..database import Shop, User, db, to_public_shop
-from ..dependencies import get_optional_current_user, require_vendor
-from ..schemas import LicenseStatus, ShopPublic, ShopRequest, ShopSearchResponse, UserRole
+from ..dependencies import get_current_user, get_optional_current_user, require_vendor
+from ..schemas import LicenseLinkResponse, LicenseStatus, ShopPublic, ShopRequest, ShopSearchResponse, UserRole
 from ..validation import normalize_identifier
 
 router = APIRouter(prefix="/shops", tags=["shops"])
@@ -170,6 +172,52 @@ async def replace_license(
     shop.license_status = LicenseStatus.PENDING_REVIEW
     db.save_shop(shop)
     return to_public_shop(shop)
+
+
+# ---------------------------------------------------------------------------
+# License document download (admin or the shop's own vendor only)
+# ---------------------------------------------------------------------------
+
+@router.post("/{shop_id}/license/link", response_model=LicenseLinkResponse)
+def create_license_link(shop_id: str, user: User = Depends(get_current_user)) -> LicenseLinkResponse:
+    """Hands an admin (or the shop's own vendor) a short-lived download
+    link for the license document. Two steps because the document is opened
+    in a browser tab / the phone's viewer, which can't send the Bearer
+    header — the link carries a signed token instead."""
+    shop = db.get_shop(shop_id)
+    # 404 rather than 403 for someone else's shop: don't reveal it exists.
+    if not shop or (user.role != UserRole.ADMIN and str(shop.vendor_id) != str(user.id)):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Negozio non trovato.")
+    if storage.resolve_license_path(shop.license_url) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Nessun documento disponibile per questo negozio.")
+
+    token = security.create_license_download_token(shop.id)
+    return LicenseLinkResponse(
+        path=f"/shops/{shop.id}/license?token={token}",
+        expires_in_minutes=settings.license_link_expire_minutes,
+    )
+
+
+@router.get("/{shop_id}/license", include_in_schema=False)
+def download_license(shop_id: str, token: str = Query(...)) -> FileResponse:
+    try:
+        payload = security.decode_token(token, expected_purpose="license_download")
+    except ValueError:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Link non valido o scaduto.")
+    if payload.get("sub") != str(shop_id):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Link non valido o scaduto.")
+
+    shop = db.get_shop(shop_id)
+    path = storage.resolve_license_path(shop.license_url) if shop else None
+    if path is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Documento non trovato.")
+    # inline: PDFs/images open in the browser tab instead of downloading.
+    return FileResponse(
+        path,
+        filename=path.name,
+        content_disposition_type="inline",
+        headers={"Cache-Control": "private, no-store"},
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ Tokens: python-jose (JWT). The same encode/decode helpers back four
 different token "purposes", distinguished by a `purpose` claim:
   - access / refresh tokens for authentication (short / long lived)
   - single-use tokens for email verification and password reset links
+  - short-lived license document download links
 """
 from __future__ import annotations
 
@@ -95,6 +96,18 @@ def create_password_reset_token(user_id: str) -> str:
         subject=user_id,
         purpose="password_reset",
         expires_delta=timedelta(minutes=settings.password_reset_expire_minutes),
+    )
+
+
+def create_license_download_token(shop_id: str) -> str:
+    """Short-lived token that lets whoever holds it download one shop's
+    license document (GET /shops/{id}/license?token=...). Needed because a
+    browser tab or the phone's document viewer can't send our Bearer
+    header, so the link itself has to carry the authorization."""
+    return _create_token(
+        subject=str(shop_id),
+        purpose="license_download",
+        expires_delta=timedelta(minutes=settings.license_link_expire_minutes),
     )
 
 
