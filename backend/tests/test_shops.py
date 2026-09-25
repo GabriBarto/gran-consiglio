@@ -207,6 +207,41 @@ def test_replace_shop_license():
     assert forbidden.status_code == 403
 
 
+def test_license_download_is_private():
+    """License files aren't publicly served: only an admin or the shop's own
+    vendor can get a (short-lived) download link, and only that link works."""
+    _, vendor_token = _new_vendor("shop.owner.lic@example.com", "Shop Owner Lic")
+    _, other_vendor_token = _new_vendor("shop.owner.lic2@example.com", "Shop Owner Lic Two")
+    admin_token = _admin_token()
+    me = client.get("/shops/me", headers=_auth_headers(vendor_token)).json()
+
+    # The stored URL itself no longer downloads anything.
+    stored_path = "/" + me["license_url"].split("://", 1)[1].split("/", 1)[1]
+    assert client.get(stored_path).status_code == 404
+
+    # Anonymous / another vendor can't get a link.
+    assert client.post(f"/shops/{me['id']}/license/link").status_code == 401
+    other = client.post(f"/shops/{me['id']}/license/link", headers=_auth_headers(other_vendor_token))
+    assert other.status_code == 404
+
+    for token in (admin_token, vendor_token):
+        link = client.post(f"/shops/{me['id']}/license/link", headers=_auth_headers(token))
+        assert link.status_code == 200, link.text
+        download = client.get(link.json()["path"])
+        assert download.status_code == 200
+        assert download.content == b"%PDF-1.4 x"
+        assert download.headers["content-type"] == "application/pdf"
+        assert download.headers["content-disposition"].startswith("inline")
+
+    # Missing, tampered, or another shop's token is rejected.
+    assert client.get(f"/shops/{me['id']}/license").status_code == 422
+    assert client.get(f"/shops/{me['id']}/license?token=nope").status_code == 403
+    other_shop = client.get("/shops/me", headers=_auth_headers(other_vendor_token)).json()
+    other_link = client.post(f"/shops/{other_shop['id']}/license/link", headers=_auth_headers(admin_token)).json()
+    other_token = other_link["path"].split("token=", 1)[1]
+    assert client.get(f"/shops/{me['id']}/license?token={other_token}").status_code == 403
+
+
 # ---------------------------------------------------------------------------
 # Admin moderation
 # ---------------------------------------------------------------------------

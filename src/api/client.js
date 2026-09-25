@@ -147,6 +147,12 @@ export async function apiRequest(path, options = {}) {
   return data;
 }
 
+// Absolute URL for a path on the backend, for links opened outside
+// apiRequest (e.g. a license download link in a new browser tab).
+export function backendUrl(path) {
+  return `${getBaseUrl()}${path}`;
+}
+
 export async function storeTokens(tokens) {
   await setTokens(tokens);
 }

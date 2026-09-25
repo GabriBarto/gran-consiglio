@@ -3,10 +3,10 @@ File storage layer for vendor license uploads.
 
 License documents must never live in the relational database — only a
 reference (URL + metadata) to the stored object does. Files are written to
-disk under LICENSE_STORAGE_DIR and actually served by this same API (see
-the StaticFiles mount in main.py) at a real, working URL — self-hosted
-rather than a cloud bucket, but not a mock: every URL returned here really
-downloads the uploaded file. Swap save_license_file()'s body for e.g. a
+disk under LICENSE_STORAGE_DIR and are NOT publicly served: the only way
+to download one is GET /shops/{id}/license with a short-lived token that
+only an admin or the shop's own vendor can obtain (see routers/shops.py).
+The URL stored in the DB just identifies the file (resolve_license_path()). Swap save_license_file()'s body for e.g. a
 boto3 upload_fileobj() (S3) or google-cloud-storage Blob.upload_from_file()
 (GCS) call when a real bucket is available — callers (routers/*.py) only
 depend on the StoredFile shape returned here, so nothing else would change.
@@ -33,8 +33,9 @@ _configured_dir = Path(settings.license_storage_dir)
 UPLOAD_DIR = _configured_dir if _configured_dir.is_absolute() else _BACKEND_DIR / _configured_dir
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Public URL prefix this directory is mounted under — see the StaticFiles
-# mount in main.py, which must use this same path.
+# URL prefix of the stored license_url values. Nothing is mounted here any
+# more (files are private), it only identifies the file — see
+# resolve_license_path().
 UPLOAD_URL_PATH = "/uploads/licenses"
 
 
@@ -66,11 +67,25 @@ def save_license_file(*, user_id: str, filename: Optional[str], content_type: Op
     dest = UPLOAD_DIR / stored_name
     dest.write_bytes(data)
 
-    # Really downloadable: this API serves UPLOAD_DIR itself at
-    # UPLOAD_URL_PATH (see the StaticFiles mount in main.py). In
-    # production with a real bucket this would instead be whatever URL the
-    # SDK hands back, e.g.:
+    # Not directly downloadable (see module docstring). With a real bucket
+    # this would be the object's key/URL instead, e.g.:
     #   s3_client.upload_fileobj(io.BytesIO(data), bucket, key)
     #   url = f"https://{bucket}.s3.amazonaws.com/{key}"
     url = f"{settings.public_base_url.rstrip('/')}{UPLOAD_URL_PATH}/{stored_name}"
     return StoredFile(file_name=filename or stored_name, content_type=content_type, url=url)
+
+
+def resolve_license_path(license_url: Optional[str]) -> Optional[Path]:
+    """Maps a stored license_url back to the file on disk, or None if it
+    doesn't point to a file we have (e.g. seed data with a placeholder URL).
+    Only the last path segment is used and it must stay inside UPLOAD_DIR,
+    so a crafted URL can never reach other files."""
+    if not license_url:
+        return None
+    name = license_url.split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+    if not name or name in (".", "..") or "\\" in name:
+        return None
+    path = (UPLOAD_DIR / name).resolve()
+    if path.parent != UPLOAD_DIR.resolve() or not path.is_file():
+        return None
+    return path
