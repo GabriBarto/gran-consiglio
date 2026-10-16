@@ -2,10 +2,14 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as Location from 'expo-location';
 import { useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
+import AddressAutocomplete from './AddressAutocomplete';
 import FormField from './FormField';
 import PrimaryButton from './PrimaryButton';
+import { isPlacesConfigured } from '../api/places';
 import { colors, radius, spacing } from '../theme';
 import { isValidPhone, isValidTime } from '../validation';
+
+const usePlaces = isPlacesConfigured();
 
 // Create/edit form for a vendor's own shop (backend/app/schemas.py::ShopRequest:
 // name, address, lat/lng, phone, opening_time, pickup_window_start/end — a
@@ -37,12 +41,23 @@ export default function ShopForm({ initialShop, onSubmit, onCancel, submitLabel 
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted') {
-        setError('Permesso di localizzazione negato: inserisci lat/lng manualmente.');
+        setError(
+          usePlaces
+            ? "Permesso di localizzazione negato: cerca l'indirizzo scrivendolo."
+            : 'Permesso di localizzazione negato: inserisci lat/lng manualmente.',
+        );
         return;
       }
       const position = await Location.getCurrentPositionAsync({});
       setLat(position.coords.latitude.toFixed(5));
       setLng(position.coords.longitude.toFixed(5));
+      if (usePlaces) {
+        // Compila anche l'indirizzo a partire dalla posizione.
+        const [place] = await Location.reverseGeocodeAsync(position.coords);
+        const street = [place?.street, place?.streetNumber].filter(Boolean).join(' ');
+        const text = [street, place?.city].filter(Boolean).join(', ');
+        if (text) setAddress(text);
+      }
     } catch {
       setError('Impossibile ottenere la posizione attuale.');
     } finally {
@@ -62,6 +77,7 @@ export default function ShopForm({ initialShop, onSubmit, onCancel, submitLabel 
   function validate() {
     if (name.trim().length < 2) return 'Il nome del negozio deve avere almeno 2 caratteri.';
     if (!address.trim()) return "L'indirizzo è obbligatorio.";
+    if (usePlaces && !lat) return "Scegli l'indirizzo da uno dei suggerimenti.";
     if (!isValidPhone(phone)) return 'Inserisci un recapito telefonico valido.';
     const latNum = Number(lat);
     const lngNum = Number(lng);
@@ -114,12 +130,31 @@ export default function ShopForm({ initialShop, onSubmit, onCancel, submitLabel 
   return (
     <View>
       <FormField label="Nome del negozio" placeholder="es. Vivaio Rossi" value={name} onChangeText={setName} />
-      <FormField
-        label="Indirizzo (via e città)"
-        placeholder="es. Via delle Rose 12, Firenze"
-        value={address}
-        onChangeText={setAddress}
-      />
+      {usePlaces ? (
+        <AddressAutocomplete
+          label="Indirizzo (via e città)"
+          placeholder="es. Via delle Rose 12, Firenze"
+          value={address}
+          onChangeText={(text) => {
+            setAddress(text);
+            // Testo modificato a mano: le coordinate precedenti non valgono più.
+            setLat('');
+            setLng('');
+          }}
+          onSelect={(place) => {
+            setAddress(place.address);
+            setLat(place.lat.toFixed(6));
+            setLng(place.lng.toFixed(6));
+          }}
+        />
+      ) : (
+        <FormField
+          label="Indirizzo (via e città)"
+          placeholder="es. Via delle Rose 12, Firenze"
+          value={address}
+          onChangeText={setAddress}
+        />
+      )}
       <FormField
         label="Telefono"
         placeholder="+39 333 1234567"
@@ -128,6 +163,9 @@ export default function ShopForm({ initialShop, onSubmit, onCancel, submitLabel 
         onChangeText={setPhone}
       />
 
+      {usePlaces ? (
+        lat ? <Text style={styles.coordsOk}>✓ Posizione confermata sulla mappa</Text> : null
+      ) : (
       <View style={styles.coordsRow}>
         <FormField
           label="Latitudine"
@@ -146,6 +184,7 @@ export default function ShopForm({ initialShop, onSubmit, onCancel, submitLabel 
           style={styles.coordField}
         />
       </View>
+      )}
       <PrimaryButton
         title="📍 Usa la mia posizione attuale"
         variant="outline"
@@ -209,6 +248,7 @@ export default function ShopForm({ initialShop, onSubmit, onCancel, submitLabel 
 const styles = StyleSheet.create({
   coordsRow: { flexDirection: 'row', gap: spacing.sm },
   coordField: { flex: 1 },
+  coordsOk: { color: colors.primary, marginBottom: spacing.sm },
   locateButton: { marginBottom: spacing.md },
   sectionLabel: { fontSize: 14, fontWeight: '600', color: colors.text, marginBottom: spacing.xs },
   licenseSection: {
