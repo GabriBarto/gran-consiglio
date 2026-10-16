@@ -1,4 +1,4 @@
-# Backend — Gran Consiglio / TooGood
+# Backend
 
 API in Python (FastAPI), con persistenza reale su **MySQL/MariaDB**. Lo
 schema del database vive esclusivamente in
@@ -191,9 +191,13 @@ dati di prova — non serve creare il DB a mano prima.
 `DATABASE_URL` in [app/config.py](app/config.py) è già pensato per questo,
 non serve un `.env`):
 
-```powershell
-# 1. avvia MySQL (XAMPP Control Panel, oppure da riga di comando):
-C:\xampp\mysql\bin\mysqld.exe --defaults-file=C:\xampp\mysql\bin\my.ini --standalone
+**Auth** (`/api/auth`)
+- `POST /register` — registrazione cliente/venditore, invia email di verifica
+- `POST /verify-email` — conferma email tramite token
+- `POST /login` — richiede email verificata, ritorna access + refresh token
+- `POST /refresh` — rotazione refresh token
+- `POST /logout` — revoca il refresh token
+- `POST /forgot-password` / `POST /reset-password`
 
 # 2. crea lo schema + i dati di prova
 Get-Content db\projectwork_en_v2.sql -Raw | C:\xampp\mysql\bin\mysql.exe -u root
