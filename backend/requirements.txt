@@ -11,6 +11,7 @@ sqlalchemy>=2.0,<3.0
 psycopg2-binary>=2.9,<3.0
 # SQLAlchemy 2.1+ uses psycopg (v3), not psycopg2, for plain postgresql:// URLs.
 psycopg[binary]>=3.2,<4.0
+firebase-admin>=6.5,<7.0
 
 # dev / testing only
 pytest>=8.3,<9.0

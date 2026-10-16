@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useMemo, useState } from 'react';
 import * as authApi from '../api/auth';
 import { onAuthExpired } from '../api/client';
+import { registerForPushNotificationsAsync, unregisterCurrentPushToken } from '../utils/pushNotifications';
 
 const AuthContext = createContext(null);
 
@@ -19,6 +20,15 @@ export function AuthProvider({ children }) {
   // backend restarted and lost its in-memory state) — clear the session even
   // if nothing on screen explicitly called logout().
   useEffect(() => onAuthExpired(() => setUser(null)), []);
+
+  // Registra questo dispositivo per le push (Firebase Cloud Messaging) ogni
+  // volta che c'è una sessione attiva — sia al primo avvio (sessione già
+  // salvata) sia subito dopo login/registrazione. No-op silenzioso se il
+  // push remoto non è disponibile (Expo Go) o il permesso viene negato —
+  // vedi src/utils/pushNotifications.js.
+  useEffect(() => {
+    if (user) registerForPushNotificationsAsync();
+  }, [user?.id]);
 
   const value = useMemo(
     () => ({
@@ -40,6 +50,7 @@ export function AuthProvider({ children }) {
         return loggedIn;
       },
       async logout() {
+        await unregisterCurrentPushToken();
         await authApi.logout();
         setUser(null);
       },

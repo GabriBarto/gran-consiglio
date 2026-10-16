@@ -28,7 +28,8 @@
         {
           "locationAlwaysAndWhenInUsePermission": "Consenti a tooGood di usare la tua posizione per trovare i vivai e i fiorai più vicini."
         }
-      ]
+      ],
+      "expo-notifications"
     ]
   }
 }

@@ -34,20 +34,26 @@ from .db.models import (
     CartItemRow,
     CartRow,
     EmailVerificationRow,
+    NotificationRow,
     OrderItemRow,
     OrderRow,
     PasswordResetRow,
+    PushTokenRow,
     RefreshTokenRow,
     StoreRow,
     UserRow,
 )
+from .order_events import fire_new_order_event, fire_order_event
+from .order_state_machine import RESTOCKABLE_STATES, assert_valid_transition
 from .schemas import (
     BoxPublic,
     CartItemPublic,
     CartPublic,
     LicenseStatus,
+    NotificationPublic,
     OrderItemPublic,
     OrderPublic,
+    OrderState,
     ShopPublic,
     UserPublic,
     UserRole,
@@ -642,7 +648,7 @@ class Repository:
                 user_id=int(user_id),
                 shop_id=int(shop_id),
                 total_price=0.0,
-                state="booked",
+                state=OrderState.PENDING_PAYMENT.value,
                 pickup_window=pickup_window,
             )
             session.add(order)
@@ -661,6 +667,12 @@ class Repository:
             order.total_price = round(total, 2)
             cart.status = "completed"
             session.flush()
+            # Checkout itself isn't a state *transition* (there's no
+            # "before" state — the order is born in pendingPayment), so it
+            # doesn't go through _transition_order/fire_order_event; it
+            # gets its own one-off trigger, to the vendor rather than the
+            # customer (see app/order_events.py).
+            fire_new_order_event(session, order=order)
             return self._order_public(session, order)
 
     def _order_public(self, session, order: OrderRow) -> OrderPublic:
@@ -689,6 +701,7 @@ class Repository:
             state=order.state,
             pickup_window=order.pickup_window,
             items=items,
+            review_unlocked=order.state == OrderState.PICKED_UP.value,
         )
 
     def get_order(self, order_id: str) -> Optional[OrderPublic]:
@@ -731,34 +744,124 @@ class Repository:
             )
             return [self._order_public(session, o) for o in orders]
 
-    def cancel_order(self, order_id: str) -> OrderPublic:
-        """Customer- or vendor-initiated cancellation of a still-booked
-        order: restocks every item back onto its box (sold_boxes -= qty,
-        floored at 0) before flipping the order to 'cancelled'."""
+    def _transition_order(self, order_id: str, target: OrderState) -> OrderPublic:
+        """The single place an order's state is ever written. Validates
+        the jump against the state machine (app/order_state_machine.py —
+        raises InvalidOrderTransition, a ValueError, if it's not a legal
+        single hop), restocks the boxes it held if it's leaving the
+        lifecycle without being picked up, writes the new state, and fires
+        that transition's side effects (app/order_events.py) — all in one
+        transaction."""
         with get_session() as session:
             order = session.get(OrderRow, int(order_id))
             if not order:
                 raise ValueError("order_not_found")
-            if order.state != "booked":
-                raise ValueError("not_cancellable")
-            for item in session.query(OrderItemRow).filter(OrderItemRow.order_id == order.id).all():
-                box = session.query(BoxRow).filter(BoxRow.id == item.box_id).with_for_update().one_or_none()
-                if box:
-                    box.sold_boxes = max(box.sold_boxes - item.quantity, 0)
-            order.state = "cancelled"
+            current = OrderState(order.state)
+            assert_valid_transition(current, target)
+
+            if current in RESTOCKABLE_STATES and target in (OrderState.CANCELLED, OrderState.EXPIRED):
+                for item in session.query(OrderItemRow).filter(OrderItemRow.order_id == order.id).all():
+                    box = session.query(BoxRow).filter(BoxRow.id == item.box_id).with_for_update().one_or_none()
+                    if box:
+                        box.sold_boxes = max(box.sold_boxes - item.quantity, 0)
+
+            order.state = target.value
             session.flush()
+            fire_order_event(session, order=order, previous_state=current, new_state=target)
             return self._order_public(session, order)
 
+    def confirm_payment(self, order_id: str) -> OrderPublic:
+        """pending_payment -> paid. Stands in for a real payment gateway
+        webhook/callback (none is integrated yet — see
+        routers/orders.py::pay_order); always succeeds once called, same
+        as everywhere else in this app that doesn't yet have a real
+        provider behind it (e.g. email, see app/email_utils.py)."""
+        return self._transition_order(order_id, OrderState.PAID)
+
+    def mark_ready_for_pickup(self, order_id: str) -> OrderPublic:
+        """paid -> ready_for_pickup, set by the vendor once the box is
+        actually prepared."""
+        return self._transition_order(order_id, OrderState.READY_FOR_PICKUP)
+
     def mark_order_picked_up(self, order_id: str) -> OrderPublic:
+        """ready_for_pickup -> picked_up, set by the vendor at handoff."""
+        return self._transition_order(order_id, OrderState.PICKED_UP)
+
+    def cancel_order(self, order_id: str) -> OrderPublic:
+        """Customer- or vendor-initiated cancellation (self-cancel or a
+        no-show) from any non-terminal state — restocks every item back
+        onto its box (sold_boxes -= qty, floored at 0)."""
+        return self._transition_order(order_id, OrderState.CANCELLED)
+
+    def expire_order(self, order_id: str) -> OrderPublic:
+        """Automated cleanup of an order that was never picked up in time
+        — for a future scheduled job (no cron in this scope, same as box
+        expiry — see backend/README.md), not a manual/customer action;
+        no router exposes this. Also restocks, same as cancellation."""
+        return self._transition_order(order_id, OrderState.EXPIRED)
+
+    # -- notifications (in-app history) ------------------------------------
+    def list_notifications(self, user_id: str) -> List[NotificationPublic]:
         with get_session() as session:
-            order = session.get(OrderRow, int(order_id))
-            if not order:
-                raise ValueError("order_not_found")
-            if order.state != "booked":
-                raise ValueError("not_pickupable")
-            order.state = "pickedUp"
+            rows = (
+                session.query(NotificationRow)
+                .filter(NotificationRow.user_id == int(user_id))
+                # `date` is a plain TIMESTAMP (second precision) — several
+                # notifications from the same fast-moving test/request can
+                # tie on it, so `id` (monotonically increasing) breaks the
+                # tie deterministically, newest last-inserted first.
+                .order_by(NotificationRow.date.desc(), NotificationRow.id.desc())
+                .all()
+            )
+            return [_notification_public(r) for r in rows]
+
+    def mark_notification_read(self, *, user_id: str, notification_id: str) -> NotificationPublic:
+        with get_session() as session:
+            row = session.get(NotificationRow, int(notification_id))
+            if not row or row.user_id != int(user_id):
+                raise ValueError("notification_not_found")
+            row.is_read = True
             session.flush()
-            return self._order_public(session, order)
+            return _notification_public(row)
+
+    def mark_all_notifications_read(self, user_id: str) -> None:
+        with get_session() as session:
+            (
+                session.query(NotificationRow)
+                .filter(NotificationRow.user_id == int(user_id), NotificationRow.is_read.is_(False))
+                .update({"is_read": True})
+            )
+
+    # -- push tokens (device registration for Firebase Cloud Messaging) ---
+    def register_push_token(self, *, user_id: str, token: str, platform: str) -> None:
+        """Upserts by token, not by (user, token): the same physical
+        device re-registering (app relaunch, a different account logging
+        in on it, ...) just moves the one row to point at whoever's
+        current, rather than accumulating stale rows for accounts no
+        longer signed in on that device."""
+        with get_session() as session:
+            row = session.query(PushTokenRow).filter(PushTokenRow.token == token).one_or_none()
+            if row:
+                row.user_id = int(user_id)
+                row.platform = platform
+            else:
+                session.add(PushTokenRow(user_id=int(user_id), token=token, platform=platform))
+
+    def unregister_push_token(self, token: str) -> None:
+        """Called on logout (see routers/notifications.py) so a
+        shared/reset device stops receiving a signed-out account's
+        pushes. Silently no-ops if the token was never registered (or
+        already removed) — logging out is never an error either way."""
+        with get_session() as session:
+            row = session.query(PushTokenRow).filter(PushTokenRow.token == token).one_or_none()
+            if row:
+                session.delete(row)
+
+
+def _notification_public(row: NotificationRow) -> NotificationPublic:
+    return NotificationPublic(
+        id=str(row.id), type=row.type, text=row.text, is_read=bool(row.is_read), date=_as_utc(row.date)
+    )
 
 
 db = Repository()

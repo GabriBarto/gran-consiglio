@@ -261,7 +261,7 @@ const styles = StyleSheet.create({
   cardName: { fontSize: 16, fontWeight: '700', color: colors.text },
   cardMeta: { fontSize: 13, color: colors.textMuted, marginTop: spacing.xs },
   cardStatus: { fontSize: 14, fontWeight: '700', color: colors.text, marginTop: spacing.sm },
-  actionsRow: { flexDirection: 'row', gap: spacing.sm, marginTop: spacing.md, flexWrap: 'wrap' },
   licenseButton: { marginTop: spacing.sm },
+  actionsRow: { flexDirection: 'row', gap: spacing.sm, marginTop: spacing.md, flexWrap: 'wrap' },
   actionButton: { flexGrow: 1, minWidth: 100 },
 });

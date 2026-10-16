@@ -5,11 +5,34 @@
 -- ---------------------------------------------------------------------
 -- NOTE (integration pass): this file is the single source of truth for
 -- the schema — the Python backend (backend/app/db/) maps to it, it does
--- not generate or replace it. Two small, additive changes were made on
+-- not generate or replace it. A few small, additive changes were made on
 -- top of the original dump to support already-built backend features,
 -- clearly marked below with "-- ADDED:" comments. Nothing else was
 -- changed. A seed-data section (2 rows per table, 4 for user/store) was
 -- appended at the end, as requested.
+--
+-- A local dev database created before the `orders.state` change below
+-- (order state machine pass) won't pick it up on its own — either
+-- re-import this file from scratch (see backend/README.md), or run by
+-- hand:
+--   ALTER TABLE `orders` MODIFY `state`
+--     ENUM('pendingPayment','paid','readyForPickup','pickedUp','cancelled','expired')
+--     NOT NULL DEFAULT 'pendingPayment';
+--   UPDATE `orders` SET `state` = 'paid' WHERE `state` = 'booked';
+--
+-- Same for the `push_token` table added by the notifications pass — a
+-- local dev database needs it created by hand if not re-imported fresh:
+--   CREATE TABLE `push_token` (
+--     `id` int(11) NOT NULL AUTO_INCREMENT,
+--     `userId` int(11) NOT NULL,
+--     `token` varchar(255) NOT NULL,
+--     `platform` enum('ios','android') NOT NULL,
+--     `createdAt` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+--     PRIMARY KEY (`id`),
+--     UNIQUE KEY `token` (`token`),
+--     KEY `fk_pushtoken_user` (`userId`),
+--     CONSTRAINT `fk_pushtoken_user` FOREIGN KEY (`userId`) REFERENCES `user` (`id`) ON DELETE CASCADE
+--   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 -- ---------------------------------------------------------------------
 
 SET SQL_MODE = "NO_AUTO_VALUE_ON_ZERO";
@@ -134,7 +157,14 @@ CREATE TABLE `orders` (
   `storeId` int(11) NOT NULL,
   `totalPrice` float NOT NULL,
   `orderDate` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  `state` enum('booked','pickedUp','cancelled','expired') NOT NULL DEFAULT 'booked',
+  -- ADDED: full order lifecycle for the state machine pass — was
+  -- enum('booked','pickedUp','cancelled','expired') DEFAULT 'booked'.
+  -- 'booked' (checkout, no payment step) split into 'pendingPayment' and
+  -- 'paid'; 'readyForPickup' inserted between 'paid' and 'pickedUp' (the
+  -- vendor prepares the box before the customer collects it). Valid
+  -- transitions/triggers live in app/order_state_machine.py +
+  -- app/order_events.py, not in the DB.
+  `state` enum('pendingPayment','paid','readyForPickup','pickedUp','cancelled','expired') NOT NULL DEFAULT 'pendingPayment',
   `pickupWindow` varchar(20) NOT NULL,
   PRIMARY KEY (`id`),
   KEY `fk_order_user` (`userId`),
@@ -233,6 +263,22 @@ CREATE TABLE `password_reset` (
   `expiresAt` timestamp NOT NULL,
   PRIMARY KEY (`userId`),
   CONSTRAINT `fk_passwordreset_user` FOREIGN KEY (`userId`) REFERENCES `user` (`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+-- ADDED: notifications pass — a device registered for push notifications
+-- (Firebase Cloud Messaging, via firebase-admin — see
+-- backend/app/push_utils.py). `token` unique across all users: registering
+-- the same device again just re-points it at whoever's now logged in.
+CREATE TABLE `push_token` (
+  `id` int(11) NOT NULL AUTO_INCREMENT,
+  `userId` int(11) NOT NULL,
+  `token` varchar(255) NOT NULL,
+  `platform` enum('ios','android') NOT NULL,
+  `createdAt` timestamp NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `token` (`token`),
+  KEY `fk_pushtoken_user` (`userId`),
+  CONSTRAINT `fk_pushtoken_user` FOREIGN KEY (`userId`) REFERENCES `user` (`id`) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 -- ---------------------------------------------------------------------

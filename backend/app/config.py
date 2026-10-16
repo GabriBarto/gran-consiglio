@@ -17,11 +17,10 @@ class Settings(BaseSettings):
 
     app_name: str = "Gran Consiglio / TooGood API"
 
-    # MySQL/MariaDB connection. Default matches a stock local XAMPP install
-    # (root, no password, default port). Point this at a different server
-    # via the DATABASE_URL env var / .env — nothing else needs to change,
-    # see app/db/engine.py.
-    database_url: str = "mysql+pymysql://root:@127.0.0.1:3306/toogood"
+    # Postgres connection (e.g. Neon). This default is a placeholder only —
+    # pymysql isn't installed any more (see requirements.txt), so a real
+    # DATABASE_URL env var / .env is required, see app/db/engine.py.
+    database_url: str = "postgresql://user:password@localhost:5432/toogood"
 
     # WARNING: this default is for local development only. Always set a
     # real SECRET_KEY via environment variable (or .env, never committed)
@@ -70,6 +69,15 @@ class Settings(BaseSettings):
 
     # Used to build the links embedded in verification / reset emails.
     frontend_base_url: str = "http://localhost:8081"
+
+    # Push notifications (Firebase Cloud Messaging, via firebase-admin —
+    # see app/push_utils.py). Optional, same pattern as SMTP above: leave
+    # unset to use the console "mock" push backend (logs instead of
+    # sending), handy for local dev without a real Firebase project. Set
+    # to the path of a service account JSON downloaded from the Firebase
+    # console (Project settings -> Service accounts -> Generate new
+    # private key) to send real pushes.
+    firebase_credentials_file: Optional[str] = None
 
 
 settings = Settings()

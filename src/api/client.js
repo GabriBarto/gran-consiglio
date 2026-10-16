@@ -7,17 +7,46 @@
 // `catch (err) { setFormError(err.message) }` as before).
 // ---------------------------------------------------------------------------
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import Constants from 'expo-constants';
 
 const TOKENS_KEY = 'toogood/tokens';
 
+// Porta a cui risponde il backend FastAPI (vedi backend/app/main.py /
+// il comando uvicorn nel README) — di norma non cambia, quindi resta
+// configurabile ma con un default sensato.
+const API_PORT = process.env.EXPO_PUBLIC_API_PORT || '8000';
+
+// In sviluppo (Expo Go / dev client), Constants.expoConfig.hostUri è
+// popolato da @expo/cli con l'host:porta usati dal telefono per raggiungere
+// il dev server Metro (es. "10.10.55.71:8081") — cioè l'IP LAN attuale di
+// questo Mac, qualunque sia la rete WiFi a cui è connesso in questo
+// momento. Il backend gira sulla stessa macchina, quindi lo stesso IP
+// (con la porta del backend, non quella di Metro) è anche l'indirizzo
+// giusto per le chiamate API: niente più IP da aggiornare a mano ad ogni
+// cambio di rete. Non è disponibile nelle build di produzione (standalone),
+// dove va comunque configurato EXPO_PUBLIC_API_BASE_URL.
+function getDevServerHost() {
+  const hostUri = Constants.expoConfig?.hostUri;
+  if (!hostUri) return null;
+  const host = hostUri.split('/')[0].split(':')[0];
+  return host || null;
+}
+
 function getBaseUrl() {
-  const url = process.env.EXPO_PUBLIC_API_BASE_URL;
-  if (!url) {
-    throw new Error(
-      'Indirizzo del backend non configurato: crea un file .env nella root del progetto (vedi .env.example) con EXPO_PUBLIC_API_BASE_URL.'
-    );
+  // Override esplicito (obbligatorio in produzione, opzionale in sviluppo
+  // per casi speciali: simulatore -> 127.0.0.1, backend su un'altra
+  // macchina, porta non standard, ecc.) ha sempre la precedenza.
+  const explicit = process.env.EXPO_PUBLIC_API_BASE_URL;
+  if (explicit) return explicit.replace(/\/$/, '');
+
+  const devHost = getDevServerHost();
+  if (devHost) {
+    return `http://${devHost}:${API_PORT}`;
   }
-  return url.replace(/\/$/, '');
+
+  throw new Error(
+    'Indirizzo del backend non configurato: crea un file .env nella root del progetto (vedi .env.example) con EXPO_PUBLIC_API_BASE_URL, oppure avvia l\'app con "npx expo start" (Expo Go / dev client) così l\'IP viene rilevato automaticamente.'
+  );
 }
 
 async function getTokens() {
