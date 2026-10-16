@@ -95,6 +95,8 @@ async def register_vendor(
     password_confirm: str = Form(...),
     phone: str = Form(...),
     shop_address: str = Form(...),
+    shop_lat: float = Form(0.0, description="Latitudine del negozio (opzionale)"),
+    shop_lng: float = Form(0.0, description="Longitudine del negozio (opzionale)"),
     license_file: UploadFile = File(..., description="Documento di licenza (PDF, JPEG o PNG)"),
 ) -> UserPublic:
     # multipart/form-data can't carry a nested Pydantic body the way a JSON
@@ -115,6 +117,8 @@ async def register_vendor(
         errors.append("Numero di telefono non valido.")
     if not shop_address.strip():
         errors.append("L'indirizzo del negozio è obbligatorio.")
+    if not (-90 <= shop_lat <= 90 and -180 <= shop_lng <= 180):
+        errors.append("Coordinate del negozio non valide.")
     if errors:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, {"errors": errors})
 
@@ -149,14 +153,15 @@ async def register_vendor(
     # account (see backend/db/projectwork_en_v2.sql), so registering as a
     # vendor creates a minimal placeholder store right away — using the
     # phone/address collected here — so the license has somewhere to live.
-    # lat/lng and hours are unknown at this point; the vendor fills them in
-    # afterwards via PUT /shops/me.
+    # lat/lng default to 0.0 when the client doesn't send them; hours are
+    # unknown at this point. The vendor fills them in afterwards via
+    # PUT /shops/me.
     db.create_shop(
         vendor_id=user.id,
         name=username.strip(),
         address=shop_address.strip(),
-        lat=0.0,
-        lng=0.0,
+        lat=shop_lat,
+        lng=shop_lng,
         phone=phone.strip(),
         license_url=stored.url,
         opening_time="09:00",

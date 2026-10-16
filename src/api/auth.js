@@ -33,7 +33,7 @@ export async function registerCustomer({ email, password, confirmPassword, usern
   return login({ email, password });
 }
 
-export async function registerVendor({ email, password, confirmPassword, username, phone, shopAddress, license }) {
+export async function registerVendor({ email, password, confirmPassword, username, phone, shopAddress, shopLat, shopLng, license }) {
   const form = new FormData();
   form.append('email', email.trim());
   form.append('username', username.trim());
@@ -41,6 +41,10 @@ export async function registerVendor({ email, password, confirmPassword, usernam
   form.append('password_confirm', confirmPassword);
   form.append('phone', phone.trim());
   form.append('shop_address', shopAddress.trim());
+  if (shopLat != null && shopLng != null) {
+    form.append('shop_lat', String(shopLat));
+    form.append('shop_lng', String(shopLng));
+  }
   form.append('license_file', toUploadFile(license), license.name ?? 'licenza');
 
   await apiRequest('/auth/register/vendor', { method: 'POST', form });

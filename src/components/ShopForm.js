@@ -2,6 +2,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import * as Location from 'expo-location';
 import { useState } from 'react';
 import { StyleSheet, Text, View } from 'react-native';
+import AddressAutocomplete from './AddressAutocomplete';
 import FormField from './FormField';
 import PrimaryButton from './PrimaryButton';
 import { colors, radius, spacing } from '../theme';
@@ -37,12 +38,17 @@ export default function ShopForm({ initialShop, onSubmit, onCancel, submitLabel 
     try {
       const { status } = await Location.requestForegroundPermissionsAsync();
       if (status !== 'granted') {
-        setError('Permesso di localizzazione negato: inserisci lat/lng manualmente.');
+        setError("Permesso di localizzazione negato: cerca l'indirizzo scrivendolo.");
         return;
       }
       const position = await Location.getCurrentPositionAsync({});
       setLat(position.coords.latitude.toFixed(5));
       setLng(position.coords.longitude.toFixed(5));
+      // Compila anche l'indirizzo a partire dalla posizione.
+      const [place] = await Location.reverseGeocodeAsync(position.coords);
+      const street = [place?.street, place?.streetNumber].filter(Boolean).join(' ');
+      const text = [street, place?.city].filter(Boolean).join(', ');
+      if (text) setAddress(text);
     } catch {
       setError('Impossibile ottenere la posizione attuale.');
     } finally {
@@ -62,6 +68,7 @@ export default function ShopForm({ initialShop, onSubmit, onCancel, submitLabel 
   function validate() {
     if (name.trim().length < 2) return 'Il nome del negozio deve avere almeno 2 caratteri.';
     if (!address.trim()) return "L'indirizzo è obbligatorio.";
+    if (!lat) return "Scegli l'indirizzo da uno dei suggerimenti.";
     if (!isValidPhone(phone)) return 'Inserisci un recapito telefonico valido.';
     const latNum = Number(lat);
     const lngNum = Number(lng);
@@ -114,11 +121,21 @@ export default function ShopForm({ initialShop, onSubmit, onCancel, submitLabel 
   return (
     <View>
       <FormField label="Nome del negozio" placeholder="es. Vivaio Rossi" value={name} onChangeText={setName} />
-      <FormField
+      <AddressAutocomplete
         label="Indirizzo (via e città)"
         placeholder="es. Via delle Rose 12, Firenze"
         value={address}
-        onChangeText={setAddress}
+        onChangeText={(text) => {
+          setAddress(text);
+          // Testo modificato a mano: le coordinate precedenti non valgono più.
+          setLat('');
+          setLng('');
+        }}
+        onSelect={(place) => {
+          setAddress(place.address);
+          setLat(place.lat.toFixed(6));
+          setLng(place.lng.toFixed(6));
+        }}
       />
       <FormField
         label="Telefono"
@@ -128,24 +145,7 @@ export default function ShopForm({ initialShop, onSubmit, onCancel, submitLabel 
         onChangeText={setPhone}
       />
 
-      <View style={styles.coordsRow}>
-        <FormField
-          label="Latitudine"
-          placeholder="43.7696"
-          keyboardType="numbers-and-punctuation"
-          value={lat}
-          onChangeText={setLat}
-          style={styles.coordField}
-        />
-        <FormField
-          label="Longitudine"
-          placeholder="11.2558"
-          keyboardType="numbers-and-punctuation"
-          value={lng}
-          onChangeText={setLng}
-          style={styles.coordField}
-        />
-      </View>
+      {lat ? <Text style={styles.coordsOk}>✓ Posizione confermata sulla mappa</Text> : null}
       <PrimaryButton
         title="📍 Usa la mia posizione attuale"
         variant="outline"
@@ -209,6 +209,7 @@ export default function ShopForm({ initialShop, onSubmit, onCancel, submitLabel 
 const styles = StyleSheet.create({
   coordsRow: { flexDirection: 'row', gap: spacing.sm },
   coordField: { flex: 1 },
+  coordsOk: { color: colors.primary, marginBottom: spacing.sm },
   locateButton: { marginBottom: spacing.md },
   sectionLabel: { fontSize: 14, fontWeight: '600', color: colors.text, marginBottom: spacing.xs },
   licenseSection: {
