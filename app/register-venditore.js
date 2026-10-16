@@ -2,6 +2,7 @@ import * as DocumentPicker from 'expo-document-picker';
 import { useRouter } from 'expo-router';
 import { useState } from 'react';
 import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, View } from 'react-native';
+import AddressAutocomplete from '../src/components/AddressAutocomplete';
 import FormField from '../src/components/FormField';
 import PrimaryButton from '../src/components/PrimaryButton';
 import { useAuth } from '../src/context/AuthContext';
@@ -19,6 +20,8 @@ export default function RegisterVenditore() {
     username: '',
     phone: '',
     shopAddress: '',
+    shopLat: null,
+    shopLng: null,
   });
   const [license, setLicense] = useState(null);
   const [errors, setErrors] = useState({});
@@ -62,6 +65,8 @@ export default function RegisterVenditore() {
 
     if (!form.shopAddress.trim()) {
       next.shopAddress = "Inserisci l'indirizzo del tuo negozio/vivaio.";
+    } else if (form.shopLat == null) {
+      next.shopAddress = "Scegli l'indirizzo da uno dei suggerimenti.";
     }
 
     if (!license) {
@@ -135,13 +140,17 @@ export default function RegisterVenditore() {
           onChangeText={(v) => setField('phone', v)}
           error={errors.phone}
         />
-        <FormField
+        <AddressAutocomplete
           label="Indirizzo del negozio"
-          placeholder="Via, città, CAP"
+          placeholder="Via, numero civico, città"
           value={form.shopAddress}
-          onChangeText={(v) => setField('shopAddress', v)}
-          error={errors.shopAddress}
+          // Testo modificato a mano: le coordinate precedenti non valgono più.
+          onChangeText={(v) => setForm((prev) => ({ ...prev, shopAddress: v, shopLat: null, shopLng: null }))}
+          onSelect={(place) =>
+            setForm((prev) => ({ ...prev, shopAddress: place.address, shopLat: place.lat, shopLng: place.lng }))
+          }
         />
+        {errors.shopAddress ? <Text style={styles.addressError}>{errors.shopAddress}</Text> : null}
 
         <View style={styles.licenseSection}>
           <Text style={styles.label}>Licenza di vendita</Text>
@@ -170,6 +179,7 @@ export default function RegisterVenditore() {
 }
 
 const styles = StyleSheet.create({
+  addressError: { color: colors.error, fontSize: 13, marginTop: -spacing.sm, marginBottom: spacing.md },
   flex: { flex: 1 },
   container: {
     flexGrow: 1,
