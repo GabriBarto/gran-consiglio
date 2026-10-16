@@ -1,70 +1,35 @@
 // ---------------------------------------------------------------------------
-// Ricerca indirizzi con Google Places API (New), via REST: nessun modulo
-// nativo, quindi funziona uguale su Expo Go, iOS, Android e web.
+// Ricerca indirizzi con Photon (https://photon.komoot.io), un geocoder
+// gratuito basato sui dati di OpenStreetMap: nessuna chiave API, nessun
+// account, funziona via fetch su Expo Go, iOS, Android e web.
 //
-// Richiede EXPO_PUBLIC_GOOGLE_MAPS_API_KEY (vedi .env.example) con "Places
-// API (New)" abilitata. Senza chiave `isPlacesConfigured()` è false e il form
-// ricade sull'inserimento manuale di lat/lng.
+// L'istanza pubblica è a uso "ragionevole" (niente carichi massicci): per
+// l'autocompletamento di un form venditore va bene. Se un giorno servisse
+// di più, Photon si può ospitare da soli e basta cambiare BASE.
 // ---------------------------------------------------------------------------
-const API_KEY = process.env.EXPO_PUBLIC_GOOGLE_MAPS_API_KEY;
-const BASE = 'https://places.googleapis.com/v1';
+const BASE = 'https://photon.komoot.io/api/';
 
-export function isPlacesConfigured() {
-  return Boolean(API_KEY);
+// Riquadro dell'Italia (lon_min, lat_min, lon_max, lat_max): evita risultati esteri.
+const ITALY_BBOX = '6.6,35.4,18.8,47.1';
+
+function formatAddress(p) {
+  const street = [p.street ?? p.name, p.housenumber].filter(Boolean).join(' ');
+  const town = [p.postcode, p.city ?? p.town ?? p.village ?? p.county].filter(Boolean).join(' ');
+  return [street, town].filter(Boolean).join(', ');
 }
 
-// Il session token raggruppa autocomplete + details in un'unica sessione di
-// fatturazione Google: se ne genera uno nuovo a ogni indirizzo scelto.
-export function newSessionToken() {
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
-}
-
-async function placesFetch(path, { method = 'GET', body, fieldMask, signal } = {}) {
-  const res = await fetch(`${BASE}${path}`, {
-    method,
-    signal,
-    headers: {
-      'Content-Type': 'application/json',
-      'X-Goog-Api-Key': API_KEY,
-      ...(fieldMask ? { 'X-Goog-FieldMask': fieldMask } : {}),
-    },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) {
-    throw new Error('Ricerca indirizzo non disponibile, riprova più tardi.');
-  }
-  return res.json();
-}
-
-// -> [{ placeId, text }]
-export async function autocompleteAddress(input, sessionToken, signal) {
-  const data = await placesFetch('/places:autocomplete', {
-    method: 'POST',
-    signal,
-    body: {
-      input,
-      sessionToken,
-      languageCode: 'it',
-      regionCode: 'IT',
-      includedPrimaryTypes: ['street_address', 'premise', 'subpremise', 'route'],
-    },
-    fieldMask: 'suggestions.placePrediction.placeId,suggestions.placePrediction.text.text',
-  });
-  return (data.suggestions ?? [])
-    .map((s) => s.placePrediction)
-    .filter(Boolean)
-    .map((p) => ({ placeId: p.placeId, text: p.text?.text ?? '' }));
-}
-
-// -> { address, lat, lng }
-export async function getPlaceDetails(placeId, sessionToken) {
-  const data = await placesFetch(
-    `/places/${encodeURIComponent(placeId)}?sessionToken=${encodeURIComponent(sessionToken)}&languageCode=it`,
-    { fieldMask: 'formattedAddress,location' },
-  );
-  return {
-    address: data.formattedAddress,
-    lat: data.location.latitude,
-    lng: data.location.longitude,
-  };
+// -> [{ id, text, address, lat, lng }]
+export async function searchAddresses(query, signal) {
+  const url = `${BASE}?q=${encodeURIComponent(query)}&limit=6&bbox=${ITALY_BBOX}`;
+  const res = await fetch(url, { signal });
+  if (!res.ok) throw new Error('Ricerca indirizzo non disponibile, riprova più tardi.');
+  const data = await res.json();
+  return (data.features ?? [])
+    .filter((f) => f.properties?.countrycode === 'IT' && f.geometry?.coordinates)
+    .map((f) => {
+      const address = formatAddress(f.properties);
+      const [lng, lat] = f.geometry.coordinates;
+      return { id: `${f.properties.osm_type}${f.properties.osm_id}`, text: address, address, lat, lng };
+    })
+    .filter((r) => r.address);
 }

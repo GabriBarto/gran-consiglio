@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from 'react';
 import { ActivityIndicator, Pressable, StyleSheet, Text, View } from 'react-native';
-import { autocompleteAddress, getPlaceDetails, newSessionToken } from '../api/places';
+import { searchAddresses } from '../api/places';
 import { colors, radius, spacing } from '../theme';
 import FormField from './FormField';
 
-// Campo indirizzo con suggerimenti Google Places. Quando il venditore sceglie
+// Campo indirizzo con suggerimenti (Photon / OpenStreetMap). Quando il venditore sceglie
 // un suggerimento chiama `onSelect({ address, lat, lng })`; se invece modifica
 // il testo a mano chiama `onChangeText` (e il form deve invalidare le
 // coordinate precedenti).
@@ -12,7 +12,6 @@ export default function AddressAutocomplete({ label, placeholder, value, onChang
   const [suggestions, setSuggestions] = useState([]);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState(null);
-  const sessionToken = useRef(newSessionToken());
   const skipNextSearch = useRef(false);
 
   useEffect(() => {
@@ -30,7 +29,7 @@ export default function AddressAutocomplete({ label, placeholder, value, onChang
       setIsLoading(true);
       setError(null);
       try {
-        setSuggestions(await autocompleteAddress(query, sessionToken.current, controller.signal));
+        setSuggestions(await searchAddresses(query, controller.signal));
       } catch (err) {
         if (err.name !== 'AbortError') setError(err.message);
       } finally {
@@ -43,20 +42,10 @@ export default function AddressAutocomplete({ label, placeholder, value, onChang
     };
   }, [value]);
 
-  async function handlePick(suggestion) {
+  function handlePick(place) {
     setSuggestions([]);
-    setIsLoading(true);
-    setError(null);
-    try {
-      const place = await getPlaceDetails(suggestion.placeId, sessionToken.current);
-      sessionToken.current = newSessionToken();
-      skipNextSearch.current = true;
-      onSelect(place);
-    } catch (err) {
-      setError(err.message);
-    } finally {
-      setIsLoading(false);
-    }
+    skipNextSearch.current = true;
+    onSelect(place);
   }
 
   return (
@@ -73,7 +62,7 @@ export default function AddressAutocomplete({ label, placeholder, value, onChang
       {suggestions.length > 0 ? (
         <View style={styles.list}>
           {suggestions.map((s) => (
-            <Pressable key={s.placeId} style={styles.item} onPress={() => handlePick(s)}>
+            <Pressable key={s.id} style={styles.item} onPress={() => handlePick(s)}>
               <Text style={styles.itemText}>📍 {s.text}</Text>
             </Pressable>
           ))}
