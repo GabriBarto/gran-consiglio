@@ -7,7 +7,7 @@ fake/mock implementations for now — see email_utils.py and storage.py.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -67,6 +67,28 @@ class Settings(BaseSettings):
 
     # Used to build the links embedded in verification / reset emails.
     frontend_base_url: str = "http://localhost:8081"
+
+    # AI "scheda di recupero pianta" (see plant_care.py). AI_PROVIDER picks
+    # who writes the sheet: "gemini" (free tier, key from
+    # https://aistudio.google.com) or "anthropic" (paid, Claude). Without the
+    # chosen provider's key the endpoint answers 503 instead of failing at
+    # startup.
+    ai_provider: Literal["gemini", "anthropic"] = "gemini"
+    gemini_api_key: Optional[str] = None
+    gemini_model: str = "gemini-3.8-flash"
+    # Tried once when gemini_model is overloaded (503) or out of quota (429).
+    gemini_fallback_model: Optional[str] = "gemini-3.5-flash-lite"
+    # Optional for "anthropic": the SDK can also pick credentials up from its
+    # own env vars / profile.
+    anthropic_api_key: Optional[str] = None
+    anthropic_model: str = "claude-opus-5-5"
+    # Optional: with a PlantNet key (https://my.plantnet.org) photos are
+    # identified by PlantNet first; without one, Claude identifies the
+    # species from the photo itself.
+    plantnet_api_key: Optional[str] = None
+    # Below this PlantNet score the match is ignored and Claude decides.
+    plantnet_min_score: float = 0.2
+    max_plant_photo_size_mb: int = 5
 
 
 settings = Settings()

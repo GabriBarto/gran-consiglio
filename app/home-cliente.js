@@ -88,6 +88,12 @@ export default function HomeCliente() {
               </View>
               <View style={styles.headerActions}>
                 <PrimaryButton title="I miei ordini 🧾" variant="outline" onPress={() => router.push('/orders')} />
+                <PrimaryButton
+                  title="Salva la tua pianta 🌱"
+                  variant="outline"
+                  onPress={() => router.push('/plant-care')}
+                  style={styles.logoutButton}
+                />
                 <PrimaryButton title="Esci" variant="outline" onPress={handleLogout} style={styles.logoutButton} />
               </View>
             </View>

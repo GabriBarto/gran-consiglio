@@ -482,3 +482,36 @@ class ReviewModerationUpdate(BaseModel):
     reads, kept for audit), false restores a previously removed one."""
 
     removed: bool
+
+
+# ---------------------------------------------------------------------------
+# AI "scheda di recupero pianta" (see app/plant_care.py)
+# ---------------------------------------------------------------------------
+
+class PlantSpeciesPublic(BaseModel):
+    id: str
+    common_name: str
+    scientific_name: str
+
+
+class IdentificationSource(str, Enum):
+    CATALOG = "catalog"      # species picked by the user from GET /plant-care/species
+    PLANTNET = "plantnet"    # recognized from the photo by PlantNet
+    AI_VISION = "ai_vision"  # recognized (or not) from the photo by the AI provider
+
+
+class RecoverySheetPublic(BaseModel):
+    species: str
+    identification_source: IdentificationSource
+    identification_confidence: str
+    # PlantNet's 0-1 score, only when identification_source == "plantnet".
+    identification_score: Optional[float] = None
+    health_assessment: str
+    likely_causes: List[str]
+    recovery_steps: List[str]
+    care_tips: List[str]
+    warning_signs: List[str]
+    # Always present and always the same server-side text (plant_care.DISCLAIMER):
+    # the app must show it next to the sheet.
+    disclaimer: str
+    generated_at: datetime

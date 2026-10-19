@@ -32,7 +32,12 @@ Stack scelto: **Node.js + Express + Prisma** (backend), **MySQL** (DB), **React 
 - [ ] Non iniziato (tabella `recensione` già presente nello schema)
 
 ## 7. Funzione AI "scheda di recupero pianta"
-- [ ] Non iniziato — da chiarire: riconoscimento immagine vs testo da prompt (vedi punto 8 del piano)
+- [x] Endpoint `POST /plant-care/recovery-sheet` (backend Python): specie da elenco (`GET /plant-care/species`) e/o foto
+- [x] Identificazione da foto con PlantNet (se `PLANTNET_API_KEY` presente) o con la visione del provider AI
+- [x] Testo generato da Gemini (piano gratuito, predefinito) o Claude, scelto con `AI_PROVIDER`; disclaimer fisso lato server sempre incluso nella risposta (`disclaimer`)
+- [ ] Schermata nell'app (client già pronto in `src/api/plantCare.js`)
+- [ ] Disclaimer anche nei Termini e Condizioni
+- [ ] Rate limiting per utente (ogni chiamata ha un costo)
 
 ## 8. Pannello admin
 - [x] Endpoint API per approvazione/rifiuto negozi

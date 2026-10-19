@@ -28,6 +28,14 @@
         {
           "locationAlwaysAndWhenInUsePermission": "Consenti a tooGood di usare la tua posizione per trovare i vivai e i fiorai più vicini."
         }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Consenti a tooGood di accedere alle tue foto per scegliere la foto della pianta da analizzare.",
+          "cameraPermission": "Consenti a tooGood di usare la fotocamera per fotografare la pianta da analizzare.",
+          "microphonePermission": false
+        }
       ]
     ]
   }
